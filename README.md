@@ -28,6 +28,69 @@ VOICE_BRIDGE_PORT=3004
 VOICE_BRIDGE_MAX_ACTIVE_CALLS=4
 ```
 
+## Railway deployment
+
+This bridge is a separate Railway service from Chusky. Deploy the
+`chusky-voice` GitHub repository, or point a new Railway service at this
+repository's root. The included `railway.toml` starts `python app.py` and uses
+`/health` as the healthcheck.
+
+Generate a Railway domain for the bridge, for example:
+
+```text
+https://chusky-voice-production.up.railway.app
+```
+
+Add these variables to the bridge service:
+
+```ini
+FACETIME_MEDIA_BRIDGE_SECRET=<same random secret configured in Chusky>
+DEEPGRAM_API_KEY=<Deepgram server API key>
+CHUSKY_VOICE_TURN_URL=https://chusky.up.railway.app/internal/facetime/turn
+CHUSKY_VOICE_STATUS_URL=https://chusky.up.railway.app/internal/facetime/status
+VOICE_BRIDGE_HOST=0.0.0.0
+```
+
+Do not set a fixed `VOICE_BRIDGE_PORT` on Railway. The bridge uses Railway's
+injected `PORT`; `VOICE_BRIDGE_PORT=3004` remains the local/Oracle fallback.
+
+Generate the shared bridge secret in PowerShell. Run this once, then paste the
+same output into both Railway services as `FACETIME_MEDIA_BRIDGE_SECRET`:
+
+```powershell
+$bytes = [byte[]]::new(32)
+$rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+$rng.GetBytes($bytes)
+$rng.Dispose()
+[Convert]::ToBase64String($bytes)
+```
+
+On the Chusky Railway service, configure:
+
+```ini
+SENDBLUE_FACETIME_ENABLED=true
+SENDBLUE_FACETIME_NUMBER=<Sendblue FaceTime-enabled number>
+FACETIME_MEDIA_BRIDGE_URL=https://chusky-voice-production.up.railway.app
+FACETIME_MEDIA_BRIDGE_SECRET=<the same generated secret>
+```
+
+For Twilio Media Streams, also set the bridge's `TWILIO_AUTH_TOKEN` and:
+
+```ini
+TWILIO_MEDIA_STREAM_URL=wss://chusky-voice-production.up.railway.app/twilio/stream
+```
+
+The Chusky service's `TWILIO_MEDIA_STREAM_URL` must use the same WSS URL. The
+bridge's public domain must support WebSocket upgrades. Do not expose the
+private bridge secret or place it in `.env.example`.
+
+The Sendblue FaceTime bridge URL is not the Sendblue receive webhook. Normal
+Sendblue messages still use:
+
+```text
+https://chusky.up.railway.app/sendblue/webhook
+```
+
 ## Oracle installation
 
 ```bash

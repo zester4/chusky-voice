@@ -776,7 +776,9 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "app:app",
-        host=os.getenv("VOICE_BRIDGE_HOST", "127.0.0.1"),
-        port=int(os.getenv("VOICE_BRIDGE_PORT", "3004")),
+        # Railway injects PORT and routes public traffic to it. Keep the
+        # explicit bridge port as a local/Oracle fallback only.
+        host=os.getenv("VOICE_BRIDGE_HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT") or os.getenv("VOICE_BRIDGE_PORT", "3004")),
         proxy_headers=True,
     )
