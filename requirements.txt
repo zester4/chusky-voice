@@ -1,0 +1,9 @@
+# The official Agora Python Server SDK downloads its matching native Linux SDK
+# during installation. It is deliberately isolated from Chusky's Node runtime.
+agora-python-server-sdk @ git+https://github.com/AgoraIO-Extensions/Agora-Python-Server-SDK.git#subdirectory=agora_rtc
+python-dotenv>=1,<2
+fastapi>=0.115,<1
+httpx>=0.27,<1
+uvicorn[standard]>=0.30,<1
+websockets>=14,<16
+twilio>=9,<10
