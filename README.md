@@ -155,14 +155,16 @@ TWILIO_MEDIA_STREAM_URL=wss://voice.selithub.shop/twilio/stream
 VOICE_STT_MODEL=flux-general-en
 VOICE_STT_EAGER_EOT_THRESHOLD=0.45
 VOICE_STT_EOT_THRESHOLD=0.65
-VOICE_STT_EOT_TIMEOUT_MS=1200
+VOICE_STT_EOT_TIMEOUT_MS=800
 VOICE_TTS_MODEL=flux-haley-en
 VOICE_BARGE_IN_MIN_CHARS=2
 VOICE_GREETING=Hi, this is Chusky. How can I help?
 ```
 
 The bridge uses Deepgram Flux conversational STT (`/v2/listen`) and streaming
-Flux TTS in raw 8 kHz μ-law, which Twilio plays without transcoding. On
+Flux TTS in raw audio. Twilio uses 8 kHz μ-law, while the Agora/FaceTime path
+uses 16 kHz linear PCM, so neither transport needs an audio-file round trip.
+On
 `EagerEndOfTurn` the bridge starts a private, read-only draft; `TurnResumed`
 cancels it, and only the definitive `EndOfTurn` is committed to Chusky memory
 and usage. This overlaps model time with end-of-turn detection without creating
