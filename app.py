@@ -18,6 +18,7 @@ import os
 import secrets
 import time
 import uuid
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,25 @@ SAMPLE_RATE = 16_000
 CHANNELS = 1
 BYTES_PER_MS = SAMPLE_RATE * CHANNELS * 2 // 1000
 PCM_CHUNK_BYTES = BYTES_PER_MS * 20
+
+
+def normalize_voice_text(value: str) -> str:
+    """Remove Markdown syntax before text reaches Deepgram TTS or history."""
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"```[^\n]*\n?([\s\S]*?)```", r"\1", text)
+    text = re.sub(r"!\[([^\]]*)\]\((https?://[^\s)]+)\)", r"\1: \2", text, flags=re.I)
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r"\1: \2", text, flags=re.I)
+    text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.M)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.M)
+    text = re.sub(r"^\s*>\s?", "", text, flags=re.M)
+    text = re.sub(r"^\s*([-*_])(?:\s*\1){2,}\s*$", "", text, flags=re.M)
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)
+    text = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_\n]+)__", r"\1", text)
+    text = re.sub(r"~~([^~\n]+)~~", r"\1", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", text)
+    return re.sub(r"\n{3,}", "\n\n", text.replace("*", "").replace("#", "")).strip()
 
 
 @dataclass(frozen=True)
@@ -594,7 +614,7 @@ class TwilioVoiceCall:
                 cost = float(payload.get("cost") or 0)
             self.metrics.agent_turn_ms_total += int((time.monotonic() - started) * 1000)
             self.metrics.agent_turns += 1
-            return VoiceTurnResult(text=text[:5000], cost=max(0, min(cost, 10)))
+            return VoiceTurnResult(text=normalize_voice_text(text)[:5000], cost=max(0, min(cost, 10)))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -670,25 +690,26 @@ class TwilioVoiceCall:
                             delta = str(event.get("text") or "")
                             full_text += delta
                             buffer += delta
-                            if buffer and (len(buffer) >= 120 or any(buffer.rstrip().endswith(mark) for mark in (".", "!", "?", ":", ";"))):
+                            if buffer and (len(buffer) >= 80 or any(buffer.rstrip().endswith(mark) for mark in (".", "!", "?", ":", ";"))):
                                 # Keep one active Flux turn. Speak frames can
                                 # stream continuously; Flush is sent exactly
                                 # once at the end of the model response.
-                                await self._send_persistent_tts(buffer)
+                                await self._send_persistent_tts(normalize_voice_text(buffer))
                                 buffer = ""
                         elif event.get("type") == "done":
                             cost = max(0, min(float(event.get("cost") or 0), 10))
                         elif event.get("type") == "error":
                             raise RuntimeError("streaming voice turn failed")
+            full_text = normalize_voice_text(full_text)
             if buffer:
-                await self._send_persistent_tts(buffer, flush=True)
+                await self._send_persistent_tts(normalize_voice_text(buffer), flush=True)
             elif full_text:
                 await self._send_persistent_tts("", flush=True)
             if full_text:
                 await asyncio.wait_for(self.tts_done_event.wait(), timeout=45.0)
             self.metrics.agent_turn_ms_total += int((time.monotonic() - started) * 1000)
             self.metrics.agent_turns += 1
-            return VoiceTurnResult(text=full_text[:5000].strip(), cost=cost)
+            return VoiceTurnResult(text=normalize_voice_text(full_text)[:5000], cost=cost)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -883,17 +904,8 @@ async def health() -> dict[str, Any]:
 
 @app.post("/calls", status_code=202)
 async def start_call(request: StartCall, authorization: str | None = Header(default=None)) -> dict[str, str]:
-    try:
-        settings = Settings.from_env()
-    except RuntimeError as error:
-        LOG.error("Voice bridge is not configured: %s", error)
-        raise HTTPException(status_code=503, detail="voice bridge is not configured") from error
-    authenticate(authorization, settings)
-    try:
-        call = await calls.start(request, settings)
-    except RuntimeError as error:
-        raise HTTPException(status_code=429, detail="voice bridge call capacity reached") from error
-    return {"status": "accepted", "sessionId": call.session_id}
+    """Retired legacy FaceTime entry point; all calls now originate in Twilio."""
+    raise HTTPException(status_code=410, detail="FaceTime calling is retired; use Twilio voice")
 
 
 @app.websocket("/twilio/stream")
