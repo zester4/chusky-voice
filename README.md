@@ -1,15 +1,15 @@
-# Chusky FaceTime media bridge
+# Chusky voice bridge
 
-This service is the private media participant for outbound Sendblue FaceTime
-calls. Chusky starts the call and gives it short-lived Agora credentials. The
-bridge joins that Agora room, receives 16 kHz PCM audio, sends final speech to
-Chusky's authenticated internal agent endpoint, synthesizes the response with
-Deepgram, and publishes PCM audio back to the call.
+This private service bridges Chusky to live voice calls. Twilio Media Streams
+provide the telephone calling path; an optional legacy Sendblue FaceTime path
+uses Agora. Chusky remains the agent brain: the bridge sends speech turns to
+Chusky's authenticated internal endpoint and streams its responses back to the
+caller using Deepgram.
 
-It is deliberately a separate process from Chusky. It never persists audio,
-Agora credentials, or phone numbers. Chusky retains bounded text turns in the
-owner's existing private conversation history so a call continues the same
-context as their chat.
+The bridge runs separately from Chusky and does not replace its model, memory,
+history, or tools. It does not persist raw audio, provider credentials, or phone
+numbers. Chusky retains only committed text turns in the owner's existing
+private conversation history so calls continue the same context as chat.
 
 It also accepts a separate **Twilio bidirectional Media Stream** at
 `/twilio/stream`. Twilio's wire format remains base64 `audio/x-mulaw` at 8 kHz.
@@ -165,11 +165,14 @@ VOICE_GREETING=Hi, this is Chusky. How can I help?
 
 The bridge uses Deepgram Flux conversational STT (`/v2/listen`) at 48 kHz
 linear16 and streaming Flux TTS (`/v2/speak`) at 24 kHz linear16 for Twilio.
-Conversion is stateful across frames to avoid discontinuities; the Twilio
-connection itself remains 8 kHz μ-law. The separate legacy Agora/FaceTime path
-retains its own audio settings and is not changed by the Twilio configuration.
-On
-`EagerEndOfTurn` the bridge starts a private, read-only draft; `TurnResumed`
+The bridge converts Twilio's 8 kHz μ-law frames to the STT format, and converts
+TTS frames back to Twilio's required 8 kHz μ-law. Resampling state is preserved
+across frames. Upsampling the telephone audio does not restore detail that was
+not present in Twilio's 8 kHz source; this format choice is not itself a promise
+of lower end-to-end latency. The optional Agora/FaceTime path retains its
+separate audio settings and is unaffected by the Twilio conversion.
+
+On `EagerEndOfTurn` the bridge starts a private, read-only draft; `TurnResumed`
 cancels it, and only the definitive `EndOfTurn` is committed to Chusky memory
 and usage. This overlaps model time with end-of-turn detection without creating
 duplicate history. When caller speech resumes while Chusky is speaking, the
@@ -184,6 +187,9 @@ window, `agentFirstDelta` measures bridge-to-first streamed Chusky text, and
 `endOfTurnToFirstAudio` measures caller-finished-to-first-audio. These contain
 timing samples only, not transcripts or phone numbers. Use them before changing
 Flux thresholds or the voice model so tuning targets the actual slow stage.
+They measure separate parts of the live path; use real calls to evaluate
+end-to-end responsiveness because local audio-conversion tests do not measure
+Twilio, Deepgram, network, or model latency.
 
 In the Twilio Console, set the purchased Twilio number's **A call comes in**
 webhook to `https://chusky.selithub.shop/twilio/inbound`, method `POST`. The
@@ -192,6 +198,21 @@ route is deliberately private-first: it rejects any caller not listed in
 Telegram owner, so only that owner's Chusky memory is available during the
 call. Add another caller only when you deliberately want that person to enter
 the same private voice context.
+
+## Run the bridge tests
+
+With the bridge dependencies installed in the active Python environment, run
+from the repository root:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The tests cover Twilio/Deepgram sample-rate contracts, stateful frame
+conversion, the Twilio WebSocket audio boundary, and latency helper behavior.
+They use mocked provider sockets and do not place a real call. To measure
+end-to-end latency, make a test call and inspect the aggregate p50/p95 metrics
+at `/health`; never enable transcript or raw-audio logging for this purpose.
 
 ## Safety boundary
 
