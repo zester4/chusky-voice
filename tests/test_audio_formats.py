@@ -6,6 +6,8 @@ from audio_formats import (
     DEEPGRAM_OUTPUT_SAMPLE_RATE,
     TWILIO_SAMPLE_RATE,
     deepgram_linear16_to_twilio_mulaw,
+    deepgram_flux_listen_url,
+    deepgram_flux_speak_url,
     twilio_deepgram_listen_url,
     twilio_deepgram_speak_url,
     twilio_mulaw_to_deepgram_linear16,
@@ -59,6 +61,11 @@ class TwilioAudioFormatTests(unittest.TestCase):
         self.assertEqual(query["eot_threshold"], ["0.65"])
         self.assertEqual(query["eot_timeout_ms"], ["800"])
 
+        # Recall's webpage supplies the same 48 kHz mono PCM directly, without
+        # Twilio's μ-law conversion; both transports share the Flux contract.
+        recall_url = deepgram_flux_listen_url("flux-general-en", 0.45, 0.65, 800)
+        self.assertEqual(parse_qs(urlparse(recall_url).query), query)
+
     def test_flux_speak_contract_uses_24khz_linear16(self):
         url = twilio_deepgram_speak_url("flux-haley-en")
         query = parse_qs(urlparse(url).query)
@@ -67,6 +74,7 @@ class TwilioAudioFormatTests(unittest.TestCase):
         self.assertEqual(query["model"], ["flux-haley-en"])
         self.assertEqual(query["encoding"], ["linear16"])
         self.assertEqual(query["sample_rate"], ["24000"])
+        self.assertEqual(deepgram_flux_speak_url("flux-haley-en"), url)
 
 
 if __name__ == "__main__":

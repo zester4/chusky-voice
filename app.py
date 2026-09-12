@@ -26,16 +26,23 @@ from typing import Any
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
+from starlette.responses import HTMLResponse
 from websockets.asyncio.client import connect
 from audio_formats import (
+    DEEPGRAM_INPUT_SAMPLE_RATE,
+    DEEPGRAM_OUTPUT_SAMPLE_RATE,
     deepgram_linear16_to_twilio_mulaw,
+    deepgram_flux_listen_url,
+    deepgram_flux_speak_url,
     twilio_deepgram_listen_url,
     twilio_deepgram_speak_url,
     twilio_mulaw_to_deepgram_linear16,
 )
 from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
+from recall_auth import valid_recall_ticket
+from recall_turns import CopilotTurnGate, MeetingContextWindow, is_recall_invocation
 
 LOG = logging.getLogger("chusky.voice_bridge")
 logging.basicConfig(level=os.getenv("VOICE_BRIDGE_LOG_LEVEL", "INFO"))
@@ -106,6 +113,52 @@ class Settings:
             os.getenv("VOICE_TTS_MODEL", "flux-haley-en").strip(),
             max(1, min(int(os.getenv("VOICE_BARGE_IN_MIN_CHARS", "2")), 100)),
             os.getenv("VOICE_GREETING", "Hi, this is Chusky. How can I help?").strip()[:500],
+        )
+
+
+@dataclass(frozen=True)
+class RecallSettings:
+    bridge_secret: str
+    deepgram_api_key: str
+    turn_stream_url: str
+    commit_turn_url: str
+    media_authorize_url: str
+    stt_model: str
+    stt_eager_eot_threshold: float
+    stt_eot_threshold: float
+    stt_eot_timeout_ms: int
+    tts_model: str
+    max_meeting_seconds: int
+    max_active_meetings: int
+    copilot_min_interval_seconds: int
+    copilot_max_evaluations: int
+
+    @classmethod
+    def from_env(cls) -> "RecallSettings":
+        if os.getenv("RECALL_MEETINGS_ENABLED", "false").strip().lower() != "true":
+            raise RuntimeError("Recall meeting support is disabled")
+        secret = os.getenv("RECALL_MEDIA_BRIDGE_SECRET", "").strip()
+        deepgram = os.getenv("DEEPGRAM_API_KEY", "").strip()
+        turn_url = os.getenv("CHUSKY_RECALL_TURN_STREAM_URL", "").strip()
+        commit_url = os.getenv("CHUSKY_RECALL_COMMIT_TURN_URL", "").strip()
+        authorize_url = os.getenv("CHUSKY_RECALL_MEDIA_AUTHORIZE_URL", "").strip()
+        endpoints = (turn_url, commit_url, authorize_url)
+        if len(secret.encode("utf-8")) < 32 or not deepgram or any(not url.startswith("https://") for url in endpoints):
+            raise RuntimeError("Recall media bridge requires its secret, Deepgram key, and HTTPS Chusky endpoints")
+        stt = os.getenv("VOICE_STT_MODEL", "flux-general-en").strip()
+        tts = os.getenv("VOICE_TTS_MODEL", "flux-haley-en").strip()
+        if not stt.startswith("flux-") or not tts.startswith("flux-"):
+            raise RuntimeError("Recall meetings require Deepgram Flux conversational STT and streaming TTS models")
+        return cls(
+            secret, deepgram, turn_url, commit_url, authorize_url, stt,
+            max(0.3, min(float(os.getenv("VOICE_STT_EAGER_EOT_THRESHOLD", "0.45")), 0.9)),
+            max(0.5, min(float(os.getenv("VOICE_STT_EOT_THRESHOLD", "0.65")), 0.9)),
+            max(500, min(int(os.getenv("VOICE_STT_EOT_TIMEOUT_MS", "800")), 60_000)),
+            tts,
+            max(60, min(int(os.getenv("RECALL_MAX_MEETING_SECONDS", "7200")), 14_400)),
+            max(1, min(int(os.getenv("RECALL_MAX_ACTIVE_MEETINGS", "4")), 20)),
+            max(5, min(int(os.getenv("RECALL_COPILOT_MIN_INTERVAL_SECONDS", "8")), 120)),
+            max(1, min(int(os.getenv("RECALL_COPILOT_MAX_EVALUATIONS", "120")), 1_000)),
         )
 
 
@@ -893,6 +946,359 @@ class TwilioVoiceCall:
             LOG.warning("Could not report Twilio call status", extra={"call_id": self.call_id, "status": status})
 
 
+class RecallVoiceSession:
+    """Interactive meeting audio relay; audio is transient and never persisted."""
+
+    def __init__(self, claims: dict[str, Any], websocket: WebSocket, settings: RecallSettings, play_intro: bool = True) -> None:
+        self.meeting_id = str(claims["meetingId"])
+        self.user_id = int(claims["userId"])
+        self.websocket = websocket
+        self.settings = settings
+        self.play_intro = play_intro
+        self.interaction_mode = claims.get("interactionMode", "addressed")
+        if self.interaction_mode not in ("addressed", "copilot", "representative"):
+            raise RuntimeError("Recall meeting interaction mode is invalid")
+        self.audio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+        self.context = MeetingContextWindow()
+        self.copilot_gate = CopilotTurnGate(settings.copilot_min_interval_seconds, settings.copilot_max_evaluations)
+        self.stop = asyncio.Event()
+        self.send_lock = asyncio.Lock()
+        self.tts_lock = asyncio.Lock()
+        self.stt_socket: Any = None
+        self.tts_socket: Any = None
+        self.tts_done_event: asyncio.Event | None = None
+        self.response_task: asyncio.Task[None] | None = None
+        self.response_started_at = 0.0
+        self.interrupted = False
+        self.turn_index = 0
+        self.copilot_limit_notified = False
+
+    async def _send_text(self, payload: dict[str, Any]) -> None:
+        async with self.send_lock:
+            await self.websocket.send_text(json.dumps(payload, separators=(",", ":")))
+
+    async def _send_bytes(self, payload: bytes) -> None:
+        async with self.send_lock:
+            await self.websocket.send_bytes(payload)
+
+    async def run(self) -> None:
+        if not self.settings.stt_model.startswith("flux-") or not self.settings.tts_model.startswith("flux-"):
+            raise RuntimeError("Recall voice requires conversational Flux STT and streaming Flux TTS")
+        stt_url = deepgram_flux_listen_url(
+            self.settings.stt_model,
+            self.settings.stt_eager_eot_threshold,
+            self.settings.stt_eot_threshold,
+            self.settings.stt_eot_timeout_ms,
+        )
+        tts_url = deepgram_flux_speak_url(self.settings.tts_model)
+        tasks: set[asyncio.Task[Any]] = set()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as self.http:
+            try:
+                async with connect(stt_url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000, ping_interval=20, ping_timeout=20, close_timeout=3) as stt:
+                    async with connect(tts_url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000, ping_interval=20, ping_timeout=20, close_timeout=3) as tts:
+                        self.stt_socket, self.tts_socket = stt, tts
+                        tasks = {
+                            asyncio.create_task(self._receive_browser(), name=f"recall-browser-{self.meeting_id}"),
+                            asyncio.create_task(self._send_stt_audio(), name=f"recall-stt-send-{self.meeting_id}"),
+                            asyncio.create_task(self._receive_stt(), name=f"recall-stt-recv-{self.meeting_id}"),
+                            asyncio.create_task(self._receive_tts(), name=f"recall-tts-recv-{self.meeting_id}"),
+                            asyncio.create_task(asyncio.sleep(self.settings.max_meeting_seconds), name=f"recall-timeout-{self.meeting_id}"),
+                        }
+                        await self._send_text({"type": "ready", "sampleRate": DEEPGRAM_INPUT_SAMPLE_RATE})
+                        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                        self.stop.set()
+                        for task in pending:
+                            task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        for task in done:
+                            if not task.get_name().startswith("recall-timeout-"):
+                                task.result()
+            finally:
+                self.stop.set()
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                if self.response_task and not self.response_task.done():
+                    self.response_task.cancel()
+                    await asyncio.gather(self.response_task, return_exceptions=True)
+                for socket in (self.stt_socket, self.tts_socket):
+                    if socket is not None:
+                        try:
+                            await socket.close()
+                        except Exception:
+                            pass
+                self.stt_socket = self.tts_socket = None
+
+    async def _receive_browser(self) -> None:
+        ready = False
+        while not self.stop.is_set():
+            event = await self.websocket.receive()
+            if event.get("type") == "websocket.disconnect":
+                return
+            text = event.get("text")
+            if text is not None:
+                try:
+                    control = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(control, dict):
+                    continue
+                if control.get("type") == "stop":
+                    return
+                if control.get("type") == "ready":
+                    try:
+                        sample_rate = int(control.get("sampleRate", 0))
+                    except (TypeError, ValueError, OverflowError):
+                        sample_rate = 0
+                    if sample_rate != DEEPGRAM_INPUT_SAMPLE_RATE:
+                        await self._send_text({"type": "error", "error": "audio_sample_rate_unsupported"})
+                        return
+                    ready = True
+                    if self.play_intro and self.response_task is None:
+                        if self.interaction_mode in ("copilot", "representative"):
+                            intro = "Hi, I’m Chusky, a disclosed AI meeting participant. I process live speech and may speak when I can help. A short text window is held in memory during this call; it is not saved. Address me by name whenever you want to ask something. Only turns I answer and my replies may be saved in the meeting owner’s private Chusky history."
+                        else:
+                            intro = "Hi, I’m Chusky, an AI assistant. I process live speech to understand requests. A short text window is held in memory during this call; it is not saved. Say ‘Chusky’ when you’d like me to respond. Only direct questions to me and my replies may be saved in the meeting owner’s private Chusky history."
+                        self.response_task = asyncio.create_task(self._speak(intro), name=f"recall-intro-{self.meeting_id}")
+                        self.response_task.add_done_callback(self._observe_response)
+                continue
+            audio = event.get("bytes")
+            if audio is None:
+                continue
+            if not ready or len(audio) < 2 or len(audio) > 96_000 or len(audio) % 2:
+                continue
+            if self.audio.full():
+                # Prefer fresh speech over stale audio during temporary network
+                # or STT backpressure. Never allow unbounded media buffering.
+                try:
+                    self.audio.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                self.audio.put_nowait(audio)
+            except asyncio.QueueFull:
+                pass
+
+    async def _send_stt_audio(self) -> None:
+        while not self.stop.is_set():
+            frame = await self.audio.get()
+            if self.stt_socket is not None:
+                await self.stt_socket.send(frame)
+
+    async def _receive_stt(self) -> None:
+        if self.stt_socket is None:
+            return
+        async for raw in self.stt_socket:
+            if not isinstance(raw, str):
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if event.get("type") != "TurnInfo":
+                continue
+            turn_event = str(event.get("event") or "")
+            transcript = normalize_voice_text(str(event.get("transcript") or ""))[:5000]
+            if turn_event in {"StartOfTurn", "TurnResumed"}:
+                # Ordinary participants talking should neither burn model/TTS
+                # budget nor cut off Chusky. Barge in only when the wake word
+                # is actually present in the current recognized turn.
+                if is_recall_invocation(transcript):
+                    await self._interrupt()
+            elif turn_event == "EndOfTurn" and transcript:
+                invoked = is_recall_invocation(transcript)
+                context = self.context.snapshot()
+                self.context.add("participant", transcript)
+                should_evaluate = invoked
+                if self.interaction_mode in ("copilot", "representative"):
+                    should_evaluate, cap_reached = self.copilot_gate.should_evaluate(invoked)
+                    if cap_reached and not self.copilot_limit_notified:
+                        self.copilot_limit_notified = True
+                        await self._send_text({"type": "mode", "mode": "addressed", "reason": "copilot_limit"})
+                elif not invoked:
+                    should_evaluate = False
+                if not should_evaluate:
+                    continue
+                self.turn_index += 1
+                if self.response_task and not self.response_task.done():
+                    await self._interrupt()
+                self.interrupted = False
+                self.response_started_at = time.monotonic()
+                self.response_task = asyncio.create_task(self._respond(transcript, self.turn_index, context), name=f"recall-response-{self.meeting_id}-{self.turn_index}")
+                self.response_task.add_done_callback(self._observe_response)
+
+    def _observe_response(self, task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # Meeting audio/transcripts are sensitive; keep diagnostics free
+            # of transcripts, response content, media URLs, and ticket values.
+            LOG.warning("Recall meeting response failed", extra={"meeting_id": self.meeting_id})
+
+    async def _interrupt(self) -> None:
+        active = self.response_task
+        if not active or active.done():
+            return
+        self.interrupted = True
+        if self.tts_socket is not None:
+            try:
+                async with self.tts_lock:
+                    await self.tts_socket.send(json.dumps({"type": "Interrupt"}))
+            except Exception:
+                pass
+        try:
+            await self._send_text({"type": "clear"})
+        except Exception:
+            pass
+        active.cancel()
+        await asyncio.gather(active, return_exceptions=True)
+        if self.response_task is active:
+            self.response_task = None
+
+    async def _receive_tts(self) -> None:
+        if self.tts_socket is None:
+            return
+        try:
+            async for raw in self.tts_socket:
+                if isinstance(raw, bytes):
+                    if not self.interrupted and not self.stop.is_set():
+                        await self._send_bytes(raw)
+                elif isinstance(raw, str):
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") == "SpeechMetadata" and self.tts_done_event is not None:
+                        self.tts_done_event.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.warning("Recall Deepgram TTS connection ended", extra={"meeting_id": self.meeting_id})
+
+    async def _send_tts(self, text: str = "", flush: bool = False) -> None:
+        if not text.strip() and not flush:
+            return
+        if self.tts_socket is None:
+            raise RuntimeError("meeting TTS connection is unavailable")
+        async with self.tts_lock:
+            if text.strip():
+                await self.tts_socket.send(json.dumps({"type": "Speak", "text": normalize_voice_text(text)}))
+            if flush:
+                await self.tts_socket.send(json.dumps({"type": "Flush"}))
+
+    async def _speak(self, text: str) -> None:
+        self.tts_done_event = asyncio.Event()
+        await self._send_tts(text, flush=True)
+        await asyncio.wait_for(self.tts_done_event.wait(), timeout=45.0)
+
+    async def _respond(self, transcript: str, turn_id: int, context: list[dict[str, str]]) -> None:
+        if self.tts_socket is None:
+            return
+        self.tts_done_event = asyncio.Event()
+        buffer = ""
+        full_text = ""
+        cost = 0.0
+        received_done = False
+        speaking = self.interaction_mode == "addressed"
+        received_delta = False
+        started = time.monotonic()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(65.0, connect=8.0)) as client:
+            async with client.stream(
+                "POST",
+                self.settings.turn_stream_url,
+                headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                json={"meetingId": self.meeting_id, "userId": self.user_id, "transcript": transcript, "context": context, "interactionMode": self.interaction_mode},
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    if event.get("type") == "delta":
+                        if not speaking:
+                            continue
+                        delta = normalize_voice_text(str(event.get("text") or ""))
+                        if not delta:
+                            continue
+                        received_delta = True
+                        full_text += delta
+                        buffer += delta
+                        if any(buffer.rstrip().endswith(mark) for mark in (".", "!", "?", ":", ";")):
+                            await self._send_tts(buffer)
+                            buffer = ""
+                        elif len(buffer) >= 120:
+                            await self._send_tts(buffer)
+                            buffer = ""
+                    elif event.get("type") == "silent":
+                        speaking = False
+                        full_text = ""
+                        buffer = ""
+                    elif event.get("type") == "speak":
+                        speaking = True
+                        received_done = False
+                    elif event.get("type") == "mode":
+                        if event.get("mode") == "addressed":
+                            self.interaction_mode = "addressed"
+                        await self._send_text({"type": "mode", "mode": self.interaction_mode, "reason": event.get("reason")})
+                    elif event.get("type") == "done":
+                        cost = max(0.0, min(float(event.get("cost") or 0), 10.0))
+                        received_done = True
+                        if event.get("speak") is False:
+                            speaking = False
+                            full_text = ""
+                            buffer = ""
+                        elif speaking and not received_delta:
+                            fallback_text = normalize_voice_text(str(event.get("text") or ""))[:5000]
+                            full_text = fallback_text
+                            buffer = fallback_text
+                    elif event.get("type") == "error":
+                        raise RuntimeError("Chusky meeting agent stream failed")
+        full_text = normalize_voice_text(full_text)[:5000]
+        if not received_done:
+            return
+        if not full_text:
+            if self.interaction_mode in ("copilot", "representative"):
+                async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
+                    response = await client.post(
+                        self.settings.commit_turn_url,
+                        headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                        json={"meetingId": self.meeting_id, "userId": self.user_id, "cost": cost, "turnId": f"flux-{turn_id}", "speak": False},
+                    )
+                    response.raise_for_status()
+            return
+        await self._send_tts(buffer, flush=True)
+        await asyncio.wait_for(self.tts_done_event.wait(), timeout=45.0)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
+            response = await client.post(
+                self.settings.commit_turn_url,
+                headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                json={"meetingId": self.meeting_id, "userId": self.user_id, "transcript": transcript, "text": full_text, "cost": cost, "turnId": f"flux-{turn_id}", "speak": True},
+            )
+            response.raise_for_status()
+        self.context.add("chusky", full_text)
+        _elapsed_ms = int((time.monotonic() - started) * 1000)
+
+
+class RecallMeetingManager:
+    def __init__(self) -> None:
+        self.active: set[str] = set()
+        self.lock = asyncio.Lock()
+
+    async def reserve(self, meeting_id: str, maximum: int) -> bool:
+        async with self.lock:
+            if meeting_id in self.active or len(self.active) >= maximum:
+                return False
+            self.active.add(meeting_id)
+            return True
+
+    async def release(self, meeting_id: str) -> None:
+        async with self.lock:
+            self.active.discard(meeting_id)
+
+
 @dataclass
 class BridgeMetrics:
     twilio_started: int = 0
@@ -964,6 +1370,8 @@ class CallManager:
 
 app = FastAPI(title="Chusky Voice Media Bridge", docs_url=None, redoc_url=None)
 calls = CallManager()
+recall_meetings = RecallMeetingManager()
+recall_handshakes = asyncio.Semaphore(32)
 metrics = BridgeMetrics()
 
 
@@ -981,6 +1389,93 @@ async def health() -> dict[str, Any]:
         return {"ok": True, "checks": {"twilioWebSocket": "configured" if twilio_ready else "misconfigured", "fluxStt": "configured" if settings.stt_model.startswith("flux-") else "misconfigured", "fluxTts": "configured" if settings.tts_model.startswith("flux-") else "misconfigured"}, "metrics": metrics.snapshot(len(calls.twilio_calls), len(calls.calls))}
     except RuntimeError:
         return {"ok": False, "checks": {"configuration": "misconfigured"}, "metrics": metrics.snapshot(len(calls.twilio_calls), len(calls.calls))}
+
+
+@app.get("/recall/health")
+async def recall_health() -> dict[str, Any]:
+    try:
+        RecallSettings.from_env()
+        return {"ok": True, "provider": "recall", "status": "configured", "activeMeetings": len(recall_meetings.active)}
+    except RuntimeError:
+        enabled = os.getenv("RECALL_MEETINGS_ENABLED", "false").strip().lower() == "true"
+        return {"ok": not enabled, "provider": "recall", "status": "misconfigured" if enabled else "disabled", "activeMeetings": len(recall_meetings.active)}
+
+
+@app.get("/recall/media", response_class=HTMLResponse)
+async def recall_media_page() -> HTMLResponse:
+    try:
+        RecallSettings.from_env()
+        page = Path(__file__).with_name("recall_media.html").read_text("utf-8")
+    except (RuntimeError, OSError):
+        return HTMLResponse("Meeting assistant unavailable", status_code=503, headers={"Cache-Control": "no-store"})
+    return HTMLResponse(page, headers={
+        "Cache-Control": "no-store, max-age=0",
+        "Referrer-Policy": "no-referrer",
+        "X-Content-Type-Options": "nosniff",
+        "Permissions-Policy": "camera=(), microphone=(self)",
+        "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; connect-src 'self' wss:; worker-src blob:; media-src blob:; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self' https://*.recall.ai",
+    })
+
+
+@app.websocket("/recall/audio")
+async def recall_audio(websocket: WebSocket) -> None:
+    """Authenticate via a scoped first frame, then stream live 48/24 kHz PCM."""
+    await websocket.accept()
+    reserved_id: str | None = None
+    handshake_slot = False
+    try:
+        try:
+            await asyncio.wait_for(recall_handshakes.acquire(), timeout=0.5)
+            handshake_slot = True
+        except asyncio.TimeoutError:
+            await websocket.close(code=1013)
+            return
+        settings = RecallSettings.from_env()
+        raw = await asyncio.wait_for(websocket.receive_text(), timeout=8.0)
+        auth = json.loads(raw)
+        if not isinstance(auth, dict):
+            await websocket.close(code=1008)
+            return
+        ticket = str(auth.get("session") or "") if auth.get("type") == "authenticate" else ""
+        claims = valid_recall_ticket(ticket, settings.bridge_secret)
+        if not claims:
+            await websocket.close(code=1008)
+            return
+        # The short-lived page token is not sufficient by itself: check that
+        # Chusky's verified Recall webhook has moved this owner's bot in-call.
+        # This prevents pre-join use and replay after the meeting ends.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as client:
+            authorized = await client.post(
+                settings.media_authorize_url,
+                headers={"Authorization": f"Bearer {settings.bridge_secret}"},
+                json={"meetingId": claims["meetingId"], "userId": claims["userId"]},
+            )
+            if authorized.status_code != 204:
+                await websocket.close(code=1008)
+                return
+        if not await recall_meetings.reserve(claims["meetingId"], settings.max_active_meetings):
+            await websocket.close(code=1013)
+            return
+        reserved_id = claims["meetingId"]
+        await websocket.send_json({"type": "authenticated"})
+        recall_handshakes.release()
+        handshake_slot = False
+        await RecallVoiceSession(claims, websocket, settings, play_intro=not bool(auth.get("reconnect"))).run()
+    except WebSocketDisconnect:
+        pass
+    except (asyncio.TimeoutError, json.JSONDecodeError, RuntimeError, httpx.HTTPError):
+        # Do not emit exception details that could contain credential URLs or
+        # request metadata. Aggregate health is available separately.
+        LOG.warning("Recall media session could not be initialized")
+        try:
+            await websocket.close(code=1011)
+        except Exception:
+            pass
+    finally:
+        if handshake_slot:
+            recall_handshakes.release()
+        if reserved_id:
+            await recall_meetings.release(reserved_id)
 
 
 @app.post("/calls", status_code=202)

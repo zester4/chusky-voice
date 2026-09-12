@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Chusky Meeting Assistant</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.45 system-ui, sans-serif; background: #101216; color: #f6f7f9; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(ellipse at 50% 0%, #282d3b 0, #101216 62%); }
+    main { width: min(92vw, 760px); min-height: 400px; padding: 48px; display: grid; align-content: center; justify-items: center; gap: 20px; border: 1px solid #333947; border-radius: 26px; background: linear-gradient(145deg, #1d222d, #15181f); box-shadow: 0 28px 90px #0008; text-align: center; }
+    .mark { width: 76px; height: 76px; display: grid; place-items: center; border-radius: 24px; color: #d8ddff; background: linear-gradient(140deg, #665be8, #4176d8); font-size: 28px; font-weight: 750; letter-spacing: -.06em; }
+    h1 { margin: 0; font-size: clamp(30px, 4vw, 44px); letter-spacing: -.04em; }
+    p { max-width: 42ch; margin: 0; color: #b4bbcb; }
+    #status { margin-top: 12px; padding: 8px 13px; border-radius: 999px; background: #252b37; color: #c6d0e3; font-size: 13px; }
+    #status[data-state="ready"] { color: #8ce4b0; }
+    #status[data-state="error"] { color: #ffaaa4; }
+  </style>
+</head>
+<body>
+  <main aria-label="Chusky Meeting Assistant">
+    <div class="mark" aria-hidden="true">C</div>
+    <h1>Chusky Meeting Assistant</h1>
+    <p>An AI participant. Live audio is processed by Chusky’s speech and AI services. A short rolling text window stays in memory during the call so Chusky can follow context; ambient speech is not saved. Only turns Chusky answers and its replies may be retained in the meeting owner’s private Chusky history. Say “Chusky” to address it.</p>
+    <div id="status" role="status" aria-live="polite" data-state="connecting">Connecting securely…</div>
+  </main>
+  <script>
+    (() => {
+      const status = document.getElementById("status");
+      const setStatus = (state, message) => { status.dataset.state = state; status.textContent = message; };
+      const params = new URLSearchParams(location.hash.slice(1));
+      const ticket = params.get("session");
+      history.replaceState(null, "", location.pathname);
+      if (!ticket || ticket.length > 2048) { setStatus("error", "Secure meeting session unavailable."); return; }
+
+      const wsProtocol = location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${wsProtocol}//${location.host}/recall/audio`;
+      let socket;
+      let reconnectAttempts = 0;
+      let reconnectTimer;
+      let closing = false;
+      let context;
+      let stream;
+      let source;
+      let processor;
+      let mute;
+      let playbackAt = 0;
+      const sources = new Set();
+      const stopPlayback = () => {
+        sources.forEach((node) => { try { node.stop(); } catch {} });
+        sources.clear();
+        playbackAt = context ? context.currentTime : 0;
+      };
+      const cleanup = () => {
+        try { processor?.disconnect(); source?.disconnect(); mute?.disconnect(); } catch {}
+        stream?.getTracks().forEach((track) => track.stop());
+        stopPlayback();
+        if (context && context.state !== "closed") context.close().catch(() => {});
+        context = stream = source = processor = mute = undefined;
+      };
+
+      const initializeAudio = async () => {
+        context = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
+        if (context.sampleRate !== 48000) throw new Error("unsupported sample rate");
+        stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: false, autoGainControl: false } });
+        const sourceText = `class ChuskyPcmCapture extends AudioWorkletProcessor {
+          constructor() { super(); this.pending = new Int16Array(960); this.used = 0; }
+          process(inputs, outputs) {
+            const input = inputs[0] && inputs[0][0];
+            const output = outputs[0] && outputs[0][0];
+            if (output) output.fill(0);
+            if (!input) return true;
+            for (let i = 0; i < input.length; i++) {
+              const sample = Math.max(-1, Math.min(1, input[i]));
+              this.pending[this.used++] = sample < 0 ? sample * 32768 : sample * 32767;
+              if (this.used === this.pending.length) {
+                const chunk = this.pending.buffer;
+                this.port.postMessage(chunk, [chunk]);
+                this.pending = new Int16Array(960); this.used = 0;
+              }
+            }
+            return true;
+          }
+        }
+        registerProcessor("chusky-pcm-capture", ChuskyPcmCapture);`;
+        const moduleUrl = URL.createObjectURL(new Blob([sourceText], { type: "text/javascript" }));
+        try { await context.audioWorklet.addModule(moduleUrl); }
+        finally { URL.revokeObjectURL(moduleUrl); }
+        source = context.createMediaStreamSource(stream);
+        processor = new AudioWorkletNode(context, "chusky-pcm-capture", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 1, channelCountMode: "explicit" });
+        mute = context.createGain(); mute.gain.value = 0;
+        processor.port.onmessage = (frame) => { if (socket?.readyState === WebSocket.OPEN) socket.send(frame.data); };
+        source.connect(processor).connect(mute).connect(context.destination);
+        if (context.state === "suspended") await context.resume();
+      };
+
+      const connect = () => {
+        if (closing) return;
+        socket = new WebSocket(wsUrl);
+        const activeSocket = socket;
+        activeSocket.binaryType = "arraybuffer";
+        activeSocket.onopen = () => activeSocket.send(JSON.stringify({ type: "authenticate", session: ticket, reconnect: reconnectAttempts > 0 }));
+        activeSocket.onmessage = async (event) => {
+        if (typeof event.data === "string") {
+          let message;
+          try { message = JSON.parse(event.data); } catch { return; }
+          if (message.type === "ready") {
+            try {
+              if (!context) await initializeAudio();
+              if (context.state === "suspended") await context.resume();
+              if (activeSocket !== socket || activeSocket.readyState !== WebSocket.OPEN) return;
+              activeSocket.send(JSON.stringify({ type: "ready", sampleRate: context.sampleRate }));
+              reconnectAttempts = 0;
+              setStatus("ready", "Connected · listening for the conversation");
+            } catch {
+              setStatus("error", "Could not start secure meeting audio.");
+              closing = true;
+              activeSocket.close(1008, "media initialization failed"); cleanup();
+            }
+          } else if (message.type === "clear") {
+            stopPlayback();
+          } else if (message.type === "mode" && message.reason === "copilot_limit") {
+            setStatus("ready", "Copilot limit reached · say Chusky to continue");
+          } else if (message.type === "error") {
+            setStatus("error", "Meeting audio could not be started.");
+          }
+          return;
+        }
+        if (!context || !(event.data instanceof ArrayBuffer) || event.data.byteLength < 2 || event.data.byteLength % 2) return;
+        const view = new DataView(event.data);
+        const sampleCount = event.data.byteLength / 2;
+        const buffer = context.createBuffer(1, sampleCount, 24000);
+        const channel = buffer.getChannelData(0);
+        for (let i = 0; i < sampleCount; i++) channel[i] = view.getInt16(i * 2, true) / 32768;
+        const node = context.createBufferSource();
+        node.buffer = buffer; node.connect(context.destination);
+        node.onended = () => sources.delete(node);
+        const startAt = Math.max(context.currentTime + 0.025, playbackAt);
+        node.start(startAt); playbackAt = startAt + buffer.duration; sources.add(node);
+        };
+        activeSocket.onerror = () => setStatus("connecting", "Connection interrupted · reconnecting…");
+        activeSocket.onclose = (event) => {
+          if (activeSocket !== socket) return;
+          stopPlayback();
+          if (closing) { cleanup(); return; }
+          if (event.code === 1008 || reconnectAttempts >= 4) {
+            setStatus("error", event.code === 1008 ? "Meeting session ended or expired." : "Could not restore meeting audio. Rejoin the meeting to try again.");
+            cleanup();
+            return;
+          }
+          const delay = Math.min(1000 * (2 ** reconnectAttempts), 8000);
+          reconnectAttempts++;
+          setStatus("connecting", "Connection interrupted · reconnecting…");
+          reconnectTimer = setTimeout(connect, delay);
+        };
+      };
+      connect();
+      window.addEventListener("pagehide", () => {
+        closing = true;
+        clearTimeout(reconnectTimer);
+        try { socket?.send(JSON.stringify({ type: "stop" })); } catch {}
+        try { socket?.close(); } catch {}
+        cleanup();
+      }, { once: true });
+    })();
+  </script>
+</body>
+</html>

@@ -50,7 +50,7 @@ def deepgram_linear16_to_twilio_mulaw(
     return audioop.lin2ulaw(pcm, SAMPLE_WIDTH_BYTES), next_state
 
 
-def twilio_deepgram_listen_url(
+def deepgram_flux_listen_url(
     model: str,
     eager_eot_threshold: float,
     eot_threshold: float,
@@ -69,7 +69,7 @@ def twilio_deepgram_listen_url(
     return f"wss://api.deepgram.com/v2/listen?{query}"
 
 
-def twilio_deepgram_speak_url(model: str) -> str:
+def deepgram_flux_speak_url(model: str) -> str:
     query = urlencode(
         {
             "model": model,
@@ -78,3 +78,13 @@ def twilio_deepgram_speak_url(model: str) -> str:
         }
     )
     return f"wss://api.deepgram.com/v2/speak?{query}"
+
+
+# Keep the established Twilio names as compatibility wrappers. Both transports
+# use the same documented Flux PCM contract (48 kHz input, 24 kHz output).
+def twilio_deepgram_listen_url(model: str, eager_eot_threshold: float, eot_threshold: float, eot_timeout_ms: int) -> str:
+    return deepgram_flux_listen_url(model, eager_eot_threshold, eot_threshold, eot_timeout_ms)
+
+
+def twilio_deepgram_speak_url(model: str) -> str:
+    return deepgram_flux_speak_url(model)
