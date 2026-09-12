@@ -12,9 +12,11 @@ owner's existing private conversation history so a call continues the same
 context as their chat.
 
 It also accepts a separate **Twilio bidirectional Media Stream** at
-`/twilio/stream`. Twilio sends and receives base64 `audio/x-mulaw` at 8 kHz;
-the bridge passes that codec directly to/from Deepgram and uses the same
-private Chusky voice-turn route for memory and safe read-only agent behavior.
+`/twilio/stream`. Twilio's wire format remains base64 `audio/x-mulaw` at 8 kHz.
+For this route, the bridge decodes and resamples caller audio to 48 kHz linear16
+for Deepgram Flux, then resamples Deepgram's 24 kHz linear16 speech and encodes
+it back to Twilio's required 8 kHz μ-law. Chusky's authenticated backend remains
+the only agent brain and supplies its existing history, memory, and tools.
 
 ## Required environment
 
@@ -161,9 +163,11 @@ VOICE_BARGE_IN_MIN_CHARS=2
 VOICE_GREETING=Hi, this is Chusky. How can I help?
 ```
 
-The bridge uses Deepgram Flux conversational STT (`/v2/listen`) and streaming
-Flux TTS in raw audio. Twilio uses 8 kHz μ-law, while the Agora/FaceTime path
-uses 16 kHz linear PCM, so neither transport needs an audio-file round trip.
+The bridge uses Deepgram Flux conversational STT (`/v2/listen`) at 48 kHz
+linear16 and streaming Flux TTS (`/v2/speak`) at 24 kHz linear16 for Twilio.
+Conversion is stateful across frames to avoid discontinuities; the Twilio
+connection itself remains 8 kHz μ-law. The separate legacy Agora/FaceTime path
+retains its own audio settings and is not changed by the Twilio configuration.
 On
 `EagerEndOfTurn` the bridge starts a private, read-only draft; `TurnResumed`
 cancels it, and only the definitive `EndOfTurn` is committed to Chusky memory
@@ -173,6 +177,13 @@ bridge cancels the active response, sends Deepgram `Interrupt`, then Twilio
 `clear`: this is barge-in. `mark` events are emitted after complete responses
 for playback tracking. `/health` exposes only aggregate latency/error/barging
 counters.
+
+The Twilio health response also reports bounded rolling p50/p95 timings under
+`metrics.twilio.latencyMs`: `fluxEagerToFinal` measures the Flux confirmation
+window, `agentFirstDelta` measures bridge-to-first streamed Chusky text, and
+`endOfTurnToFirstAudio` measures caller-finished-to-first-audio. These contain
+timing samples only, not transcripts or phone numbers. Use them before changing
+Flux thresholds or the voice model so tuning targets the actual slow stage.
 
 In the Twilio Console, set the purchased Twilio number's **A call comes in**
 webhook to `https://chusky.selithub.shop/twilio/inbound`, method `POST`. The

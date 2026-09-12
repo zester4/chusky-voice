@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections import deque
 import hashlib
 import hmac
 import json
@@ -19,7 +20,7 @@ import secrets
 import time
 import uuid
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,13 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from websockets.asyncio.client import connect
+from audio_formats import (
+    deepgram_linear16_to_twilio_mulaw,
+    twilio_deepgram_listen_url,
+    twilio_deepgram_speak_url,
+    twilio_mulaw_to_deepgram_linear16,
+)
+from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
 
 LOG = logging.getLogger("chusky.voice_bridge")
 logging.basicConfig(level=os.getenv("VOICE_BRIDGE_LOG_LEVEL", "INFO"))
@@ -412,13 +420,17 @@ class VoiceTurnResult:
 class TwilioVoiceCall:
     """Twilio bidirectional Media Stream transport.
 
-    Twilio sends and accepts base64 `audio/x-mulaw` at 8 kHz. Deepgram is
-    configured for the same codec, avoiding lossy conversion or audio files.
+    Twilio sends and accepts base64 `audio/x-mulaw` at 8 kHz. The bridge
+    converts at the provider boundary to Deepgram's configured 48 kHz input
+    and 24 kHz output formats; Chusky remains the sole agent/LLM runtime.
     """
     def __init__(self, call_id: str, user_id: int, stream_sid: str, websocket: WebSocket, settings: Settings, metrics: "BridgeMetrics") -> None:
         self.call_id, self.user_id, self.stream_sid = call_id, user_id, stream_sid
         self.websocket, self.settings = websocket, settings
         self.metrics = metrics
+        # Keep one client alive for the call so successive turns reuse the
+        # authenticated connection to Chusky rather than paying a new setup cost.
+        self.http = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=5.0))
         self.stop = asyncio.Event()
         # Twilio typically sends 20 ms frames. Keep at most one second of
         # audio so a transient STT slowdown drops stale speech instead of
@@ -429,12 +441,15 @@ class TwilioVoiceCall:
         self.draft_transcript = ""
         self.draft_turn_index: int | None = None
         self.finalized_turn_indexes: set[int] = set()
+        self.eager_end_times: dict[int, float] = {}
         self.response_started_at = 0.0
         self.tts_socket: Any | None = None
         self.tts_lock = asyncio.Lock()
         self.tts_reader_task: asyncio.Task[None] | None = None
         self.tts_done_event: asyncio.Event | None = None
         self.tts_first_audio_recorded = False
+        self.stt_resample_state: object | None = None
+        self.tts_resample_state: object | None = None
         self.twilio_send_lock = asyncio.Lock()
         self.interrupted = False
 
@@ -463,6 +478,7 @@ class TwilioVoiceCall:
                 self.draft_task.cancel()
                 await asyncio.gather(self.draft_task, return_exceptions=True)
             await self._close_persistent_tts()
+            await self.http.aclose()
             try:
                 await self.websocket.close()
             except Exception:
@@ -471,20 +487,22 @@ class TwilioVoiceCall:
     async def _run(self) -> None:
         if not self.settings.stt_model.startswith("flux-"):
             raise RuntimeError("VOICE_STT_MODEL must be a Deepgram Flux conversational model, for example flux-general-en")
-        query = (
-            f"model={self.settings.stt_model}&encoding=mulaw&sample_rate=8000"
-            f"&eager_eot_threshold={self.settings.stt_eager_eot_threshold}"
-            f"&eot_threshold={self.settings.stt_eot_threshold}"
-            f"&eot_timeout_ms={self.settings.stt_eot_timeout_ms}"
+        url = twilio_deepgram_listen_url(
+            self.settings.stt_model,
+            self.settings.stt_eager_eot_threshold,
+            self.settings.stt_eot_threshold,
+            self.settings.stt_eot_timeout_ms,
         )
-        async with connect(f"wss://api.deepgram.com/v2/listen?{query}", additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000) as socket:
+        async with connect(url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000) as socket:
             inbound = asyncio.create_task(self._receive_twilio(), name=f"twilio-in-{self.call_id}")
             sender = asyncio.create_task(self._send_audio(socket), name=f"twilio-stt-{self.call_id}")
             transcripts = asyncio.create_task(self._receive_transcripts(socket), name=f"twilio-out-{self.call_id}")
             if self.settings.greeting:
                 self.interrupted = False
                 self.response_started_at = time.monotonic()
-                self.response_task = asyncio.create_task(self._speak(self.settings.greeting), name=f"twilio-greeting-{self.call_id}")
+                # Open and keep the per-call TTS socket warm during the greeting
+                # so the first actual answer doesn't pay for a new handshake.
+                self.response_task = asyncio.create_task(self._speak_persistent_text(self.settings.greeting), name=f"twilio-greeting-{self.call_id}")
                 self.response_task.add_done_callback(self._observe_response_task)
             done, pending = await asyncio.wait({inbound, sender, transcripts}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
@@ -514,7 +532,13 @@ class TwilioVoiceCall:
 
     async def _send_audio(self, socket: Any) -> None:
         while not self.stop.is_set():
-            await socket.send(await self.audio.get())
+            twilio_frame = await self.audio.get()
+            linear16, self.stt_resample_state = twilio_mulaw_to_deepgram_linear16(
+                twilio_frame,
+                self.stt_resample_state,
+            )
+            if linear16:
+                await socket.send(linear16)
 
     @staticmethod
     def _same_transcript(left: str, right: str) -> bool:
@@ -535,12 +559,20 @@ class TwilioVoiceCall:
             except (TypeError, ValueError):
                 continue
             if turn_event in {"StartOfTurn", "TurnResumed"}:
+                if turn_event == "TurnResumed":
+                    self.eager_end_times.pop(turn_index, None)
                 await self._barge_in()
                 continue
             if turn_event == "EagerEndOfTurn" and transcript:
+                self.eager_end_times[turn_index] = time.monotonic()
+                if len(self.eager_end_times) > 8:
+                    self.eager_end_times.pop(next(iter(self.eager_end_times)))
                 await self._start_draft(transcript, turn_index)
                 continue
             if turn_event == "EndOfTurn" and transcript:
+                eager_at = self.eager_end_times.pop(turn_index, None)
+                if eager_at is not None:
+                    self.metrics.flux_eager_to_final_samples.append(int((time.monotonic() - eager_at) * 1000))
                 if turn_index in self.finalized_turn_indexes:
                     continue
                 self.finalized_turn_indexes.add(turn_index)
@@ -589,6 +621,9 @@ class TwilioVoiceCall:
             await self._send_twilio({"event": "clear", "streamSid": self.stream_sid})
         except Exception:
             pass
+        # The interrupted TTS stream is discarded; restart rate conversion at
+        # the next utterance instead of carrying filter history across it.
+        self.tts_resample_state = None
         for task in active:
             task.cancel()
         await asyncio.gather(*active, return_exceptions=True)
@@ -606,12 +641,16 @@ class TwilioVoiceCall:
     async def _request_agent(self, transcript: str) -> VoiceTurnResult:
         started = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0)) as client:
-                response = await client.post(self.settings.chusky_turn_url, headers={"Authorization": f"Bearer {self.settings.bridge_secret}"}, json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "speculative": True})
-                response.raise_for_status()
-                payload = response.json()
-                text = str(payload.get("text") or "").strip()
-                cost = float(payload.get("cost") or 0)
+            response = await self.http.post(
+                self.settings.chusky_turn_url,
+                headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "speculative": True},
+                timeout=httpx.Timeout(45.0, connect=10.0),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            text = str(payload.get("text") or "").strip()
+            cost = float(payload.get("cost") or 0)
             self.metrics.agent_turn_ms_total += int((time.monotonic() - started) * 1000)
             self.metrics.agent_turns += 1
             return VoiceTurnResult(text=normalize_voice_text(text)[:5000], cost=max(0, min(cost, 10)))
@@ -626,8 +665,9 @@ class TwilioVoiceCall:
             return
         if not self.settings.tts_model.startswith("flux-"):
             raise RuntimeError("VOICE_TTS_MODEL must be a Flux streaming model (for example flux-haley-en)")
-        url = f"wss://api.deepgram.com/v2/speak?model={self.settings.tts_model}&encoding=mulaw&sample_rate=8000"
+        url = twilio_deepgram_speak_url(self.settings.tts_model)
         self.tts_socket = await connect(url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000)
+        self.tts_resample_state = None
         self.tts_reader_task = asyncio.create_task(self._receive_persistent_tts(), name=f"twilio-tts-{self.call_id}")
 
     async def _receive_persistent_tts(self) -> None:
@@ -642,11 +682,17 @@ class TwilioVoiceCall:
                     # response_started_at is reset for every final turn;
                     # record only the first audio frame for that response.
                     if not self.tts_first_audio_recorded:
-                        self.metrics.tts_first_audio_ms_total += int((time.monotonic() - self.response_started_at) * 1000)
+                        first_audio_ms = int((time.monotonic() - self.response_started_at) * 1000)
+                        self.metrics.tts_first_audio_ms_total += first_audio_ms
                         self.metrics.tts_first_audio_count += 1
+                        self.metrics.end_of_turn_to_first_audio_samples.append(first_audio_ms)
                         self.tts_first_audio_recorded = True
-                    for offset in range(0, len(raw), 1600):
-                        payload = base64.b64encode(raw[offset:offset + 1600]).decode()
+                    twilio_audio, self.tts_resample_state = deepgram_linear16_to_twilio_mulaw(
+                        raw,
+                        self.tts_resample_state,
+                    )
+                    for offset in range(0, len(twilio_audio), 1600):
+                        payload = base64.b64encode(twilio_audio[offset:offset + 1600]).decode()
                         await self._send_twilio({"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}})
                 elif isinstance(raw, str):
                     event = json.loads(raw)
@@ -675,31 +721,43 @@ class TwilioVoiceCall:
         buffer = ""
         full_text = ""
         cost = 0.0
+        first_delta_recorded = False
         self.tts_done_event = asyncio.Event()
         self.tts_first_audio_recorded = False
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-                stream_url = f"{self.settings.chusky_turn_url[:-len('/turn')]}/turn-stream"
-                async with client.stream("POST", stream_url, headers={"Authorization": f"Bearer {self.settings.bridge_secret}"}, json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "speculative": False}) as response:
-                    response.raise_for_status()
-                    async for line in response.aiter_lines():
-                        if not line:
-                            continue
-                        event = json.loads(line)
-                        if event.get("type") == "delta":
-                            delta = str(event.get("text") or "")
-                            full_text += delta
-                            buffer += delta
-                            if buffer and (len(buffer) >= 80 or any(buffer.rstrip().endswith(mark) for mark in (".", "!", "?", ":", ";"))):
-                                # Keep one active Flux turn. Speak frames can
-                                # stream continuously; Flush is sent exactly
-                                # once at the end of the model response.
-                                await self._send_persistent_tts(normalize_voice_text(buffer))
-                                buffer = ""
-                        elif event.get("type") == "done":
-                            cost = max(0, min(float(event.get("cost") or 0), 10))
-                        elif event.get("type") == "error":
-                            raise RuntimeError("streaming voice turn failed")
+            stream_url = f"{self.settings.chusky_turn_url[:-len('/turn')]}/turn-stream"
+            async with self.http.stream(
+                "POST", stream_url,
+                headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "speculative": False},
+                timeout=httpx.Timeout(60.0, connect=10.0),
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    event = json.loads(line)
+                    if event.get("type") == "delta":
+                        delta = str(event.get("text") or "")
+                        if delta and not first_delta_recorded:
+                            self.metrics.agent_first_delta_samples.append(int((time.monotonic() - started) * 1000))
+                            first_delta_recorded = True
+                        full_text += delta
+                        buffer += delta
+                        if any(buffer.rstrip().endswith(mark) for mark in (".", "!", "?", ":", ";")):
+                            # Speak a complete phrase as soon as its boundary
+                            # arrives; don't wait for a large fixed buffer.
+                            await self._send_persistent_tts(normalize_voice_text(buffer))
+                            buffer = ""
+                        else:
+                            chunk = take_tts_chunk(buffer)
+                            if chunk:
+                                spoken, buffer = chunk
+                                await self._send_persistent_tts(normalize_voice_text(spoken))
+                    elif event.get("type") == "done":
+                        cost = max(0, min(float(event.get("cost") or 0), 10))
+                    elif event.get("type") == "error":
+                        raise RuntimeError("streaming voice turn failed")
             full_text = normalize_voice_text(full_text)
             if buffer:
                 await self._send_persistent_tts(normalize_voice_text(buffer), flush=True)
@@ -728,6 +786,7 @@ class TwilioVoiceCall:
             await asyncio.gather(self.tts_reader_task, return_exceptions=True)
         self.tts_reader_task = None
         socket, self.tts_socket = self.tts_socket, None
+        self.tts_resample_state = None
         if socket is not None:
             try:
                 await socket.close()
@@ -736,24 +795,27 @@ class TwilioVoiceCall:
 
     async def _respond_final(self, transcript: str, turn_index: int) -> None:
         try:
-            if self.draft_task and self.draft_turn_index == turn_index and self._same_transcript(self.draft_transcript, transcript):
-                result = await self.draft_task
-                stream_spoke = False
-            else:
+            matching_draft = bool(
+                self.draft_task
+                and self.draft_turn_index == turn_index
+                and self._same_transcript(self.draft_transcript, transcript)
+            )
+            result = await resolve_speculative_draft(self.draft_task, transcript_matches=matching_draft)
+            stream_spoke = result is None
+            if result is None:
                 if self.draft_task and not self.draft_task.done():
                     self.draft_task.cancel()
                     await asyncio.gather(self.draft_task, return_exceptions=True)
                 result = await self._request_agent_stream(transcript)
-                stream_spoke = True
             if not result.text or self.interrupted:
                 return
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
-                response = await client.post(
-                    f"{self.settings.chusky_turn_url[:-len('/turn')]}/commit-turn",
-                    headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
-                    json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "text": result.text, "cost": result.cost, "turnId": f"{turn_index}"},
-                )
-                response.raise_for_status()
+            response = await self.http.post(
+                f"{self.settings.chusky_turn_url[:-len('/turn')]}/commit-turn",
+                headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "text": result.text, "cost": result.cost, "turnId": f"{turn_index}"},
+                timeout=httpx.Timeout(15.0, connect=5.0),
+            )
+            response.raise_for_status()
             if not self.interrupted and not stream_spoke:
                 await self._speak_persistent_text(result.text)
         except Exception:
@@ -764,13 +826,13 @@ class TwilioVoiceCall:
                     await self._close_persistent_tts()
                     result = await self._request_agent(transcript)
                     if result.text:
-                        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as client:
-                            response = await client.post(
-                                f"{self.settings.chusky_turn_url[:-len('/turn')]}/commit-turn",
-                                headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
-                                json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "text": result.text, "cost": result.cost, "turnId": f"{turn_index}"},
-                            )
-                            response.raise_for_status()
+                        response = await self.http.post(
+                            f"{self.settings.chusky_turn_url[:-len('/turn')]}/commit-turn",
+                            headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                            json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "text": result.text, "cost": result.cost, "turnId": f"{turn_index}"},
+                            timeout=httpx.Timeout(15.0, connect=5.0),
+                        )
+                        response.raise_for_status()
                         await self._speak(result.text)
                 except Exception:
                     self.metrics.agent_failures += 1
@@ -781,8 +843,9 @@ class TwilioVoiceCall:
     async def _speak(self, text: str) -> None:
         if not self.settings.tts_model.startswith("flux-"):
             raise RuntimeError("VOICE_TTS_MODEL must be a Flux streaming model (for example flux-haley-en)")
-        url = f"wss://api.deepgram.com/v2/speak?model={self.settings.tts_model}&encoding=mulaw&sample_rate=8000"
+        url = twilio_deepgram_speak_url(self.settings.tts_model)
         first_audio_at: float | None = None
+        resample_state: object | None = None
         async with connect(url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000) as socket:
             self.tts_socket = socket
             try:
@@ -795,12 +858,18 @@ class TwilioVoiceCall:
                             return
                         if first_audio_at is None:
                             first_audio_at = time.monotonic()
-                            self.metrics.tts_first_audio_ms_total += int((first_audio_at - self.response_started_at) * 1000)
+                            first_audio_ms = int((first_audio_at - self.response_started_at) * 1000)
+                            self.metrics.tts_first_audio_ms_total += first_audio_ms
                             self.metrics.tts_first_audio_count += 1
+                            self.metrics.end_of_turn_to_first_audio_samples.append(first_audio_ms)
+                        twilio_audio, resample_state = deepgram_linear16_to_twilio_mulaw(
+                            raw,
+                            resample_state,
+                        )
                         # Twilio permits any payload size; bounded 200 ms chunks
                         # reduce jitter and make clear/mark interruption prompt.
-                        for offset in range(0, len(raw), 1600):
-                            payload = base64.b64encode(raw[offset:offset + 1600]).decode()
+                        for offset in range(0, len(twilio_audio), 1600):
+                            payload = base64.b64encode(twilio_audio[offset:offset + 1600]).decode()
                             await self._send_twilio({"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}})
                     elif isinstance(raw, str):
                         event = json.loads(raw)
@@ -813,9 +882,13 @@ class TwilioVoiceCall:
 
     async def _notify_status(self, status: str, error: str | None = None) -> None:
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
-                response = await client.post(self.settings.chusky_status_url, headers={"Authorization": f"Bearer {self.settings.bridge_secret}"}, json={"callId": self.call_id, "userId": self.user_id, "status": status, **({"error": error} if error else {})})
-                response.raise_for_status()
+            response = await self.http.post(
+                self.settings.chusky_status_url,
+                headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                json={"callId": self.call_id, "userId": self.user_id, "status": status, **({"error": error} if error else {})},
+                timeout=httpx.Timeout(10.0, connect=5.0),
+            )
+            response.raise_for_status()
         except Exception:
             LOG.warning("Could not report Twilio call status", extra={"call_id": self.call_id, "status": status})
 
@@ -832,6 +905,9 @@ class BridgeMetrics:
     agent_failures: int = 0
     tts_first_audio_count: int = 0
     tts_first_audio_ms_total: int = 0
+    flux_eager_to_final_samples: deque[int] = field(default_factory=lambda: deque(maxlen=256))
+    agent_first_delta_samples: deque[int] = field(default_factory=lambda: deque(maxlen=256))
+    end_of_turn_to_first_audio_samples: deque[int] = field(default_factory=lambda: deque(maxlen=256))
 
     def snapshot(self, active_twilio: int, active_facetime: int) -> dict[str, Any]:
         return {
@@ -845,6 +921,11 @@ class BridgeMetrics:
                 "agentFailures": self.agent_failures,
                 "averageAgentTurnMs": round(self.agent_turn_ms_total / self.agent_turns) if self.agent_turns else None,
                 "averageTtsFirstAudioMs": round(self.tts_first_audio_ms_total / self.tts_first_audio_count) if self.tts_first_audio_count else None,
+                "latencyMs": {
+                    "fluxEagerToFinal": latency_summary(list(self.flux_eager_to_final_samples)),
+                    "agentFirstDelta": latency_summary(list(self.agent_first_delta_samples)),
+                    "endOfTurnToFirstAudio": latency_summary(list(self.end_of_turn_to_first_audio_samples)),
+                },
             },
             "facetime": {"active": active_facetime},
         }
