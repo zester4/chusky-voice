@@ -949,11 +949,12 @@ class TwilioVoiceCall:
 class RecallVoiceSession:
     """Interactive meeting audio relay; audio is transient and never persisted."""
 
-    def __init__(self, claims: dict[str, Any], websocket: WebSocket, settings: RecallSettings, play_intro: bool = True) -> None:
+    def __init__(self, claims: dict[str, Any], websocket: WebSocket, settings: RecallSettings, recall_metrics: "RecallMetrics", play_intro: bool = True) -> None:
         self.meeting_id = str(claims["meetingId"])
         self.user_id = int(claims["userId"])
         self.websocket = websocket
         self.settings = settings
+        self.metrics = recall_metrics
         self.play_intro = play_intro
         self.interaction_mode = claims.get("interactionMode", "addressed")
         if self.interaction_mode not in ("addressed", "copilot", "representative"):
@@ -997,6 +998,7 @@ class RecallVoiceSession:
                 async with connect(stt_url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000, ping_interval=20, ping_timeout=20, close_timeout=3) as stt:
                     async with connect(tts_url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000, ping_interval=20, ping_timeout=20, close_timeout=3) as tts:
                         self.stt_socket, self.tts_socket = stt, tts
+                        self.metrics.deepgram_sessions += 1
                         tasks = {
                             asyncio.create_task(self._receive_browser(), name=f"recall-browser-{self.meeting_id}"),
                             asyncio.create_task(self._send_stt_audio(), name=f"recall-stt-send-{self.meeting_id}"),
@@ -1055,6 +1057,7 @@ class RecallVoiceSession:
                         await self._send_text({"type": "error", "error": "audio_sample_rate_unsupported"})
                         return
                     ready = True
+                    self.metrics.browser_ready += 1
                     if self.play_intro and self.response_task is None:
                         if self.interaction_mode in ("copilot", "representative"):
                             intro = "Hi, I’m Chusky, a disclosed AI meeting participant. I process live speech and may speak when I can help. A short text window is held in memory during this call; it is not saved. Address me by name whenever you want to ask something. Only turns I answer and my replies may be saved in the meeting owner’s private Chusky history."
@@ -1077,6 +1080,8 @@ class RecallVoiceSession:
                     pass
             try:
                 self.audio.put_nowait(audio)
+                self.metrics.browser_audio_frames += 1
+                self.metrics.browser_audio_bytes += len(audio)
             except asyncio.QueueFull:
                 pass
 
@@ -1107,6 +1112,7 @@ class RecallVoiceSession:
                 if is_recall_invocation(transcript):
                     await self._interrupt()
             elif turn_event == "EndOfTurn" and transcript:
+                self.metrics.stt_final_turns += 1
                 invoked = is_recall_invocation(transcript)
                 context = self.context.snapshot()
                 self.context.add("participant", transcript)
@@ -1119,8 +1125,10 @@ class RecallVoiceSession:
                 elif not invoked:
                     should_evaluate = False
                 if not should_evaluate:
+                    self.metrics.turns_suppressed += 1
                     continue
                 self.turn_index += 1
+                self.metrics.agent_requests += 1
                 if self.response_task and not self.response_task.done():
                     await self._interrupt()
                 self.interrupted = False
@@ -1136,7 +1144,8 @@ class RecallVoiceSession:
         except Exception:
             # Meeting audio/transcripts are sensitive; keep diagnostics free
             # of transcripts, response content, media URLs, and ticket values.
-            LOG.warning("Recall meeting response failed", extra={"meeting_id": self.meeting_id})
+            self.metrics.agent_failures += 1
+            LOG.warning("Recall meeting response failed", extra={"meeting_id": self.meeting_id, "stage": "agent_response", "error_type": type(task.exception()).__name__ if not task.cancelled() and task.exception() else "unknown"})
 
     async def _interrupt(self) -> None:
         active = self.response_task
@@ -1166,6 +1175,8 @@ class RecallVoiceSession:
                 if isinstance(raw, bytes):
                     if not self.interrupted and not self.stop.is_set():
                         await self._send_bytes(raw)
+                        self.metrics.tts_audio_frames += 1
+                        self.metrics.tts_audio_bytes += len(raw)
                 elif isinstance(raw, str):
                     try:
                         event = json.loads(raw)
@@ -1233,10 +1244,12 @@ class RecallVoiceSession:
                             await self._send_tts(buffer)
                             buffer = ""
                     elif event.get("type") == "silent":
+                        self.metrics.agent_silent += 1
                         speaking = False
                         full_text = ""
                         buffer = ""
                     elif event.get("type") == "speak":
+                        self.metrics.agent_speaking += 1
                         speaking = True
                         received_done = False
                     elif event.get("type") == "mode":
@@ -1297,6 +1310,44 @@ class RecallMeetingManager:
     async def release(self, meeting_id: str) -> None:
         async with self.lock:
             self.active.discard(meeting_id)
+
+
+@dataclass
+class RecallMetrics:
+    """Aggregate, content-free diagnostics for the live Recall media path."""
+    websocket_sessions: int = 0
+    browser_ready: int = 0
+    browser_audio_frames: int = 0
+    browser_audio_bytes: int = 0
+    deepgram_sessions: int = 0
+    stt_final_turns: int = 0
+    turns_suppressed: int = 0
+    agent_requests: int = 0
+    agent_speaking: int = 0
+    agent_silent: int = 0
+    agent_failures: int = 0
+    tts_audio_frames: int = 0
+    tts_audio_bytes: int = 0
+    initialization_failures: int = 0
+
+    def snapshot(self, active_meetings: int) -> dict[str, Any]:
+        return {
+            "activeMeetings": active_meetings,
+            "websocketSessions": self.websocket_sessions,
+            "browserReady": self.browser_ready,
+            "browserAudioFrames": self.browser_audio_frames,
+            "browserAudioBytes": self.browser_audio_bytes,
+            "deepgramSessions": self.deepgram_sessions,
+            "sttFinalTurns": self.stt_final_turns,
+            "turnsSuppressed": self.turns_suppressed,
+            "agentRequests": self.agent_requests,
+            "agentSpeaking": self.agent_speaking,
+            "agentSilent": self.agent_silent,
+            "agentFailures": self.agent_failures,
+            "ttsAudioFrames": self.tts_audio_frames,
+            "ttsAudioBytes": self.tts_audio_bytes,
+            "initializationFailures": self.initialization_failures,
+        }
 
 
 @dataclass
@@ -1371,6 +1422,7 @@ class CallManager:
 app = FastAPI(title="Chusky Voice Media Bridge", docs_url=None, redoc_url=None)
 calls = CallManager()
 recall_meetings = RecallMeetingManager()
+recall_metrics = RecallMetrics()
 recall_handshakes = asyncio.Semaphore(32)
 metrics = BridgeMetrics()
 
@@ -1395,10 +1447,10 @@ async def health() -> dict[str, Any]:
 async def recall_health() -> dict[str, Any]:
     try:
         RecallSettings.from_env()
-        return {"ok": True, "provider": "recall", "status": "configured", "activeMeetings": len(recall_meetings.active)}
+        return {"ok": True, "provider": "recall", "status": "configured", "metrics": recall_metrics.snapshot(len(recall_meetings.active))}
     except RuntimeError:
         enabled = os.getenv("RECALL_MEETINGS_ENABLED", "false").strip().lower() == "true"
-        return {"ok": not enabled, "provider": "recall", "status": "misconfigured" if enabled else "disabled", "activeMeetings": len(recall_meetings.active)}
+        return {"ok": not enabled, "provider": "recall", "status": "misconfigured" if enabled else "disabled", "metrics": recall_metrics.snapshot(len(recall_meetings.active))}
 
 
 @app.get("/recall/media", response_class=HTMLResponse)
@@ -1457,15 +1509,17 @@ async def recall_audio(websocket: WebSocket) -> None:
             await websocket.close(code=1013)
             return
         reserved_id = claims["meetingId"]
+        recall_metrics.websocket_sessions += 1
         await websocket.send_json({"type": "authenticated"})
         recall_handshakes.release()
         handshake_slot = False
-        await RecallVoiceSession(claims, websocket, settings, play_intro=not bool(auth.get("reconnect"))).run()
+        await RecallVoiceSession(claims, websocket, settings, recall_metrics, play_intro=not bool(auth.get("reconnect"))).run()
     except WebSocketDisconnect:
         pass
     except (asyncio.TimeoutError, json.JSONDecodeError, RuntimeError, httpx.HTTPError):
         # Do not emit exception details that could contain credential URLs or
         # request metadata. Aggregate health is available separately.
+        recall_metrics.initialization_failures += 1
         LOG.warning("Recall media session could not be initialized")
         try:
             await websocket.close(code=1011)
