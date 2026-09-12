@@ -222,10 +222,20 @@ matrix does not list GoTo, so this interactive voice path deliberately rejects
 those links until Recall documents and we verify support. A
 verified Recall bot-status webhook updates owner-scoped state. The bridge
 requires both an expiring, meeting-scoped HMAC ticket and a server-authenticated check that
-the matching meeting is currently in-call. The ticket is carried in the URL
+the matching meeting is currently in-call. If Output Media loads before the
+verified status webhook arrives, the bridge waits up to 15 seconds for the
+owned meeting to become active instead of treating the race as an expired
+session. Invalid tickets, bridge-secret mismatches, and unavailable meetings
+have distinct safe close reasons. The ticket is carried in the URL
 fragment (not sent in HTTP request URLs) and then the first websocket frame.
 Uvicorn access logging is disabled so ticket-bearing paths cannot appear in its
 standard request logs.
+
+For live diagnostics, `GET /recall/health` exposes content-free aggregate
+counters for ticket rejection, authorization wait/timeout, browser audio,
+Deepgram sessions and final turns, agent requests/failures, and TTS output. In
+addressed mode, say “Chusky” before the question; copilot and representative
+modes evaluate ordinary turns within the configured limits.
 
 Configure Chusky's root service:
 

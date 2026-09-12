@@ -116,7 +116,7 @@
               if (activeSocket !== socket || activeSocket.readyState !== WebSocket.OPEN) return;
               activeSocket.send(JSON.stringify({ type: "ready", sampleRate: context.sampleRate }));
               reconnectAttempts = 0;
-              setStatus("ready", "Connected · listening for the conversation");
+              setStatus("ready", message.interactionMode === "addressed" ? "Connected · say ‘Chusky’ to speak" : "Connected · listening for opportunities");
             } catch {
               setStatus("error", "Could not start secure meeting audio.");
               closing = true;
@@ -126,8 +126,10 @@
             stopPlayback();
           } else if (message.type === "mode" && message.reason === "copilot_limit") {
             setStatus("ready", "Copilot limit reached · say Chusky to continue");
+          } else if (message.type === "status" && message.code === "meeting_not_ready") {
+            setStatus("connecting", "Waiting for Chusky to be admitted to the meeting…");
           } else if (message.type === "error") {
-            setStatus("error", "Meeting audio could not be started.");
+            setStatus("error", "Meeting audio could not be started. Check the voice service configuration.");
           }
           return;
         }
@@ -148,8 +150,16 @@
           if (activeSocket !== socket) return;
           stopPlayback();
           if (closing) { cleanup(); return; }
-          if (event.code === 1008 || reconnectAttempts >= 4) {
-            setStatus("error", event.code === 1008 ? "Meeting session ended or expired." : "Could not restore meeting audio. Rejoin the meeting to try again.");
+          const terminalBridgeFailure = event.code === 1011 && ["bridge_auth_failed", "media_authorization_failed"].includes(event.reason);
+          if (event.code === 1008 || terminalBridgeFailure || reconnectAttempts >= 4) {
+            let message = "Could not restore meeting audio. Rejoin the meeting to try again.";
+            if (event.code === 1008 && event.reason === "invalid_ticket") message = "Secure meeting session could not be verified. Rejoin and check the shared bridge secret.";
+            else if (event.code === 1008 && event.reason === "meeting_unavailable") message = "This meeting is no longer active or could not be verified.";
+            else if (event.code === 1011 && event.reason === "bridge_auth_failed") message = "Meeting bridge authentication failed. Check that both services use the same bridge secret.";
+            else if (event.code === 1011 && event.reason === "media_authorization_failed") message = "Chusky could not verify the meeting with its main service. Check the service URL and logs.";
+            else if (event.code === 1011) message = "Meeting speech service failed to start. Check the voice service logs and Deepgram configuration.";
+            else if (event.code === 1013 && event.reason === "meeting_not_ready") message = "Chusky could not confirm that the meeting is live. Check Recall bot status and webhook delivery.";
+            setStatus("error", message);
             cleanup();
             return;
           }

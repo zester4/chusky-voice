@@ -41,7 +41,7 @@ from audio_formats import (
     twilio_mulaw_to_deepgram_linear16,
 )
 from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
-from recall_auth import valid_recall_ticket
+from recall_auth import valid_recall_ticket, wait_for_media_authorization
 from recall_turns import CopilotTurnGate, MeetingContextWindow, is_recall_invocation
 
 LOG = logging.getLogger("chusky.voice_bridge")
@@ -1006,7 +1006,7 @@ class RecallVoiceSession:
                             asyncio.create_task(self._receive_tts(), name=f"recall-tts-recv-{self.meeting_id}"),
                             asyncio.create_task(asyncio.sleep(self.settings.max_meeting_seconds), name=f"recall-timeout-{self.meeting_id}"),
                         }
-                        await self._send_text({"type": "ready", "sampleRate": DEEPGRAM_INPUT_SAMPLE_RATE})
+                        await self._send_text({"type": "ready", "sampleRate": DEEPGRAM_INPUT_SAMPLE_RATE, "interactionMode": self.interaction_mode})
                         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                         self.stop.set()
                         for task in pending:
@@ -1141,11 +1141,25 @@ class RecallVoiceSession:
             task.result()
         except asyncio.CancelledError:
             pass
-        except Exception:
+        except Exception as exc:
             # Meeting audio/transcripts are sensitive; keep diagnostics free
             # of transcripts, response content, media URLs, and ticket values.
+            # Log the error class and a sanitized message so configuration
+            # problems (e.g. 401 wrong bridge secret, 404 meeting not in_call)
+            # are immediately visible without exposing sensitive data.
             self.metrics.agent_failures += 1
-            LOG.warning("Recall meeting response failed", extra={"meeting_id": self.meeting_id, "stage": "agent_response", "error_type": type(task.exception()).__name__ if not task.cancelled() and task.exception() else "unknown"})
+            exc_type = type(exc).__name__
+            # Include HTTP status codes so 401/404/429 are distinguishable.
+            status_hint = ""
+            if hasattr(exc, "response") and hasattr(exc.response, "status_code"):
+                status_hint = f" HTTP {exc.response.status_code}"
+            elif hasattr(exc, "status_code"):
+                status_hint = f" HTTP {exc.status_code}"
+            LOG.warning(
+                "Recall meeting response failed: %s%s",
+                exc_type, status_hint,
+                extra={"meeting_id": self.meeting_id, "stage": "agent_response", "error_type": exc_type},
+            )
 
     async def _interrupt(self) -> None:
         active = self.response_task
@@ -1207,6 +1221,7 @@ class RecallVoiceSession:
 
     async def _respond(self, transcript: str, turn_id: int, context: list[dict[str, str]]) -> None:
         if self.tts_socket is None:
+            LOG.warning("Recall meeting response skipped: TTS socket unavailable", extra={"meeting_id": self.meeting_id})
             return
         self.tts_done_event = asyncio.Event()
         buffer = ""
@@ -1223,6 +1238,12 @@ class RecallVoiceSession:
                 headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
                 json={"meetingId": self.meeting_id, "userId": self.user_id, "transcript": transcript, "context": context, "interactionMode": self.interaction_mode},
             ) as response:
+                if response.status_code != 200:
+                    LOG.warning(
+                        "Recall turn-stream returned HTTP %d (check RECALL_MEDIA_BRIDGE_SECRET and meeting in_call status)",
+                        response.status_code,
+                        extra={"meeting_id": self.meeting_id},
+                    )
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line:
@@ -1328,6 +1349,10 @@ class RecallMetrics:
     agent_failures: int = 0
     tts_audio_frames: int = 0
     tts_audio_bytes: int = 0
+    invalid_ticket_rejections: int = 0
+    media_authorization_waits: int = 0
+    media_authorization_timeouts: int = 0
+    media_authorization_rejections: int = 0
     initialization_failures: int = 0
 
     def snapshot(self, active_meetings: int) -> dict[str, Any]:
@@ -1346,6 +1371,10 @@ class RecallMetrics:
             "agentFailures": self.agent_failures,
             "ttsAudioFrames": self.tts_audio_frames,
             "ttsAudioBytes": self.tts_audio_bytes,
+            "invalidTicketRejections": self.invalid_ticket_rejections,
+            "mediaAuthorizationWaits": self.media_authorization_waits,
+            "mediaAuthorizationTimeouts": self.media_authorization_timeouts,
+            "mediaAuthorizationRejections": self.media_authorization_rejections,
             "initializationFailures": self.initialization_failures,
         }
 
@@ -1475,6 +1504,7 @@ async def recall_audio(websocket: WebSocket) -> None:
     await websocket.accept()
     reserved_id: str | None = None
     handshake_slot = False
+    stage = "handshake"
     try:
         try:
             await asyncio.wait_for(recall_handshakes.acquire(), timeout=0.5)
@@ -1482,29 +1512,61 @@ async def recall_audio(websocket: WebSocket) -> None:
         except asyncio.TimeoutError:
             await websocket.close(code=1013)
             return
+        stage = "configuration"
         settings = RecallSettings.from_env()
+        stage = "handshake"
         raw = await asyncio.wait_for(websocket.receive_text(), timeout=8.0)
         auth = json.loads(raw)
         if not isinstance(auth, dict):
             await websocket.close(code=1008)
             return
         ticket = str(auth.get("session") or "") if auth.get("type") == "authenticate" else ""
+        stage = "ticket_verification"
         claims = valid_recall_ticket(ticket, settings.bridge_secret)
         if not claims:
-            await websocket.close(code=1008)
+            recall_metrics.invalid_ticket_rejections += 1
+            LOG.warning("Recall media ticket rejected", extra={"stage": stage})
+            await websocket.close(code=1008, reason="invalid_ticket")
             return
         # The short-lived page token is not sufficient by itself: check that
         # Chusky's verified Recall webhook has moved this owner's bot in-call.
         # This prevents pre-join use and replay after the meeting ends.
-        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=4.0)) as client:
-            authorized = await client.post(
-                settings.media_authorize_url,
-                headers={"Authorization": f"Bearer {settings.bridge_secret}"},
-                json={"meetingId": claims["meetingId"], "userId": claims["userId"]},
-            )
-            if authorized.status_code != 204:
-                await websocket.close(code=1008)
-                return
+        stage = "media_authorization"
+        pending_notified = False
+        async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
+            async def check_media_authorization() -> int:
+                nonlocal pending_notified
+                response = await client.post(
+                    settings.media_authorize_url,
+                    headers={"Authorization": f"Bearer {settings.bridge_secret}"},
+                    json={"meetingId": claims["meetingId"], "userId": claims["userId"]},
+                )
+                if response.status_code == 425 and not pending_notified:
+                    pending_notified = True
+                    recall_metrics.media_authorization_waits += 1
+                    await websocket.send_json({"type": "status", "code": "meeting_not_ready"})
+                return response.status_code
+
+            authorization_status = await wait_for_media_authorization(check_media_authorization, timeout_seconds=15.0)
+        if authorization_status != 204:
+            if authorization_status == 425:
+                recall_metrics.media_authorization_timeouts += 1
+                LOG.warning("Recall media authorization timed out waiting for active meeting", extra={"stage": stage, "http_status": 425})
+                await websocket.close(code=1013, reason="meeting_not_ready")
+            elif authorization_status in (404, 410):
+                recall_metrics.media_authorization_rejections += 1
+                LOG.warning("Recall media authorization denied", extra={"stage": stage, "http_status": authorization_status})
+                await websocket.close(code=1008, reason="meeting_unavailable")
+            elif authorization_status == 401:
+                recall_metrics.media_authorization_rejections += 1
+                LOG.error("Recall media bridge authentication rejected", extra={"stage": stage, "http_status": authorization_status})
+                await websocket.close(code=1011, reason="bridge_auth_failed")
+            else:
+                recall_metrics.media_authorization_rejections += 1
+                LOG.warning("Recall media authorization service rejected request", extra={"stage": stage, "http_status": authorization_status})
+                await websocket.close(code=1011, reason="media_authorization_failed")
+            return
+        stage = "meeting_capacity"
         if not await recall_meetings.reserve(claims["meetingId"], settings.max_active_meetings):
             await websocket.close(code=1013)
             return
@@ -1513,16 +1575,23 @@ async def recall_audio(websocket: WebSocket) -> None:
         await websocket.send_json({"type": "authenticated"})
         recall_handshakes.release()
         handshake_slot = False
+        stage = "voice_session"
         await RecallVoiceSession(claims, websocket, settings, recall_metrics, play_intro=not bool(auth.get("reconnect"))).run()
     except WebSocketDisconnect:
         pass
-    except (asyncio.TimeoutError, json.JSONDecodeError, RuntimeError, httpx.HTTPError):
+    except Exception as exc:
         # Do not emit exception details that could contain credential URLs or
         # request metadata. Aggregate health is available separately.
         recall_metrics.initialization_failures += 1
-        LOG.warning("Recall media session could not be initialized")
+        error_type = type(exc).__name__
+        response = getattr(exc, "response", None)
+        http_status = getattr(response, "status_code", None)
+        LOG.warning(
+            "Recall media session could not be initialized",
+            extra={"stage": stage, "error_type": error_type, **({"http_status": http_status} if http_status else {})},
+        )
         try:
-            await websocket.close(code=1011)
+            await websocket.close(code=1011, reason="voice_service_unavailable")
         except Exception:
             pass
     finally:

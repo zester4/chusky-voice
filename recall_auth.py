@@ -1,6 +1,7 @@
 """Recall session-ticket verification; kept stdlib-only for isolated testing."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -46,3 +47,28 @@ def valid_recall_ticket(ticket: str, secret: str, now_seconds: int | None = None
         return result
     except (ValueError, TypeError, KeyError, AttributeError, json.JSONDecodeError, base64.binascii.Error):
         return None
+
+
+async def wait_for_media_authorization(
+    check,
+    *,
+    timeout_seconds: float = 15.0,
+    initial_interval: float = 0.5,
+    max_interval: float = 2.0,
+    monotonic=time.monotonic,
+    sleep=asyncio.sleep,
+) -> int:
+    """Retry only the explicit pre-call state; never retry auth or terminal failures."""
+    if timeout_seconds < 0 or initial_interval <= 0 or max_interval <= 0:
+        raise ValueError("invalid media authorization retry policy")
+    deadline = monotonic() + timeout_seconds
+    interval = initial_interval
+    while True:
+        status = await check()
+        if status != 425:
+            return status
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return status
+        await sleep(min(interval, remaining))
+        interval = min(interval * 2, max_interval)
