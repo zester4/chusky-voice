@@ -1,6 +1,11 @@
 import unittest
 
-from recall_turns import CopilotTurnGate, MeetingContextWindow, is_recall_invocation
+from recall_turns import (
+    CopilotTurnGate,
+    MeetingContextWindow,
+    is_recall_invocation,
+    parse_meeting_media_authorization,
+)
 
 
 class RecallInvocationTests(unittest.TestCase):
@@ -54,6 +59,37 @@ class CopilotTurnGateTests(unittest.TestCase):
         self.assertEqual(gate.should_evaluate(False, now=108), (True, False))
         self.assertEqual(gate.should_evaluate(False, now=120), (False, True))
         self.assertEqual(gate.should_evaluate(True, now=120), (True, False))
+
+
+class MeetingAuthorizationPresentationTests(unittest.TestCase):
+    def test_uses_authorized_company_greeting_and_proactive_mode(self):
+        mode, greeting = parse_meeting_media_authorization(
+            {
+                "interactionMode": "representative",
+                "greeting": "Hi everyone, I’m Chusky, the AI sales representative for Acme.",
+            },
+            "addressed",
+        )
+        self.assertEqual(mode, "representative")
+        self.assertIn("sales representative for Acme", greeting)
+
+    def test_old_authorization_response_uses_short_mode_appropriate_greeting(self):
+        mode, greeting = parse_meeting_media_authorization(None, "addressed")
+        self.assertEqual(mode, "addressed")
+        self.assertIn("Say ‘Chusky’", greeting)
+        mode, greeting = parse_meeting_media_authorization(None, "copilot")
+        self.assertEqual(mode, "copilot")
+        self.assertIn("speak up when I can add something useful", greeting)
+
+    def test_rejects_malformed_authorized_mode_or_unbounded_greeting(self):
+        for payload in (
+            {"interactionMode": "unbounded", "greeting": "Hello"},
+            {"interactionMode": "copilot", "greeting": "x" * 501},
+            {"interactionMode": "copilot", "greeting": "Hello", "extra": "no"},
+        ):
+            with self.subTest(payload=payload):
+                with self.assertRaises(ValueError):
+                    parse_meeting_media_authorization(payload, "addressed")
 
 
 if __name__ == "__main__":

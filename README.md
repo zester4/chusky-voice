@@ -329,12 +329,17 @@ substitute for the staging lifecycle checks above; mark those complete only
 after observing callbacks from an actual staging bot.
 
 The tool supports `addressed`, `copilot`, and owner-configured `representative`
-modes. `addressed` calls the model when someone says “Chusky.” Copilot evaluates
-eligible turns at most once every configured interval, speaks only with a
-`SPEAK` verdict, and stays silent otherwise. Representative mode uses the
-owner's configured company objective, approved knowledge, action allowlist, and
-account aliases; it is similarly budgeted and fails silent when it has no useful
-contribution. The Chusky root service enforces the configured evaluation limit
+modes. An omitted mode defaults to the enabled representative profile, or to
+proactive copilot when no profile is enabled; choose `addressed` only when the
+owner explicitly wants wake-word-only behavior. The root authorization response
+provides the effective mode and a short spoken introduction to the authenticated
+bridge. Representative greetings use the configured AI role and company name;
+they contain no credentials or private memory. `addressed` calls the model when
+someone says “Chusky.” Copilot evaluates eligible turns at most once every
+configured interval, speaks only with a `SPEAK` verdict, and stays silent
+otherwise. Representative mode uses the owner's configured company objective,
+approved knowledge, action allowlist, and account aliases; it is similarly
+budgeted and fails silent when it has no useful contribution. The Chusky root service enforces the configured evaluation limit
 atomically in Redis across bridge reconnects and replicas (default 120 per
 meeting); the voice service's local gate is an optimization only. At the cap it
 falls back to addressed-only while direct wake-word requests continue to work.
