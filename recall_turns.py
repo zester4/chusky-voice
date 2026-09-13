@@ -13,9 +13,8 @@ MeetingMode = Literal["addressed", "copilot", "representative"]
 
 
 def default_meeting_greeting(mode: str) -> str:
-    if mode == "addressed":
-        return "Hi everyone, I’m Chusky. Say my name if you’d like me to jump in."
-    return "Hi everyone, I’m Chusky. I’ll follow along and join in when I can help."
+    del mode
+    return "Hi, I’m Chusky."
 
 
 def parse_meeting_media_authorization(value: Any, fallback_mode: str) -> tuple[MeetingMode, str]:

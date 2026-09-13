@@ -75,8 +75,8 @@ class MeetingEchoGuardTests(unittest.TestCase):
         guard.remember_output("I can send the onboarding checklist after this meeting.", now=100)
         self.assertTrue(guard.is_echo("I can send the onboarding checklist after this meeting", now=104))
 
-        guard.remember_output("Hi everyone, I’m Chusky. I’ll follow along and join in when I can help.", now=150)
-        self.assertTrue(guard.is_echo("Hi everyone, I’m Chusky", now=151), "partial STT must not interrupt Chusky's greeting")
+        guard.remember_output("Hi, I’m Chusky.", now=150)
+        self.assertTrue(guard.is_echo("Hi I’m Chusky", now=151), "partial STT must not interrupt Chusky's greeting")
 
         guard.remember_output("The next step is to confirm the launch date", now=200)
         guard.remember_output("and assign an implementation owner.", now=201)
@@ -100,7 +100,7 @@ class MeetingConversationDefaultsTests(unittest.TestCase):
     def test_default_join_opens_with_a_natural_brief_introduction(self):
         self.assertEqual(
             default_meeting_greeting("copilot"),
-            "Hi everyone, I’m Chusky. I’ll follow along and join in when I can help.",
+            "Hi, I’m Chusky.",
         )
 
 
@@ -116,13 +116,13 @@ class MeetingAuthorizationPresentationTests(unittest.TestCase):
         self.assertEqual(mode, "representative")
         self.assertIn("sales representative for Acme", greeting)
 
-    def test_old_authorization_response_uses_short_mode_appropriate_greeting(self):
+    def test_old_authorization_response_uses_minimal_greeting(self):
         mode, greeting = parse_meeting_media_authorization(None, "addressed")
         self.assertEqual(mode, "addressed")
-        self.assertIn("say my name", greeting.lower())
+        self.assertEqual(greeting, "Hi, I’m Chusky.")
         mode, greeting = parse_meeting_media_authorization(None, "copilot")
         self.assertEqual(mode, "copilot")
-        self.assertIn("join in when I can help", greeting)
+        self.assertEqual(greeting, "Hi, I’m Chusky.")
 
     def test_rejects_malformed_authorized_mode_or_unbounded_greeting(self):
         for payload in (
