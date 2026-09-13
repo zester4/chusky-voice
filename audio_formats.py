@@ -69,6 +69,29 @@ def deepgram_flux_listen_url(
     return f"wss://api.deepgram.com/v2/listen?{query}"
 
 
+def deepgram_nova_listen_url(
+    model: str,
+    endpointing_ms: int,
+    utterance_end_ms: int,
+) -> str:
+    """Build the documented Nova live-STT contract for Recall meetings."""
+    query = urlencode(
+        {
+            "model": model,
+            "encoding": "linear16",
+            "sample_rate": DEEPGRAM_INPUT_SAMPLE_RATE,
+            "channels": CHANNELS,
+            "interim_results": "true",
+            "smart_format": "true",
+            "punctuate": "true",
+            "vad_events": "true",
+            "endpointing": endpointing_ms,
+            "utterance_end_ms": utterance_end_ms,
+        }
+    )
+    return f"wss://api.deepgram.com/v1/listen?{query}"
+
+
 def deepgram_flux_speak_url(model: str) -> str:
     query = urlencode(
         {

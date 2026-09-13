@@ -15,6 +15,18 @@ only the exact owner-granted connected-app actions and native reminder/task
 tools. It does not receive private memory or arbitrary Composio tools. Neither
 transport persists raw audio in this bridge.
 
+Recall meetings use Deepgram **Nova-3** for live transcription and retain
+Deepgram Flux TTS for streamed speech. Nova-3 runs on Listen v1 with VAD,
+interim results, 500 ms endpointing, and a 1,000 ms utterance-end fallback.
+The bridge assembles finalized segments before asking Chusky to respond. This
+is independent of the Flux STT configuration used for Twilio telephone calls.
+
+Recall meetings use Deepgram **Nova-3** for live transcription and retain
+Deepgram Flux TTS for streamed speech. Nova-3 runs on Listen v1 with VAD,
+interim results, 500 ms endpointing, and a 1,000 ms utterance-end fallback.
+The bridge assembles finalized segments before asking Chusky to respond. This
+is independent of the Flux STT configuration used for Twilio telephone calls.
+
 It also accepts a separate **Twilio bidirectional Media Stream** at
 `/twilio/stream`. Twilio's wire format remains base64 `audio/x-mulaw` at 8 kHz.
 For this route, the bridge decodes and resamples caller audio to 48 kHz linear16

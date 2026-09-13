@@ -8,6 +8,7 @@ from audio_formats import (
     deepgram_linear16_to_twilio_mulaw,
     deepgram_flux_listen_url,
     deepgram_flux_speak_url,
+    deepgram_nova_listen_url,
     twilio_deepgram_listen_url,
     twilio_deepgram_speak_url,
     twilio_mulaw_to_deepgram_linear16,
@@ -75,6 +76,20 @@ class TwilioAudioFormatTests(unittest.TestCase):
         self.assertEqual(query["encoding"], ["linear16"])
         self.assertEqual(query["sample_rate"], ["24000"])
         self.assertEqual(deepgram_flux_speak_url("flux-haley-en"), url)
+
+    def test_nova_listen_contract_uses_v1_vad_endpointing_and_stable_results(self):
+        url = deepgram_nova_listen_url("nova-3", 500, 1000)
+        query = parse_qs(urlparse(url).query)
+
+        self.assertEqual(urlparse(url).path, "/v1/listen")
+        self.assertEqual(query["model"], ["nova-3"])
+        self.assertEqual(query["encoding"], ["linear16"])
+        self.assertEqual(query["sample_rate"], ["48000"])
+        self.assertEqual(query["channels"], ["1"])
+        self.assertEqual(query["interim_results"], ["true"])
+        self.assertEqual(query["vad_events"], ["true"])
+        self.assertEqual(query["endpointing"], ["500"])
+        self.assertEqual(query["utterance_end_ms"], ["1000"])
 
 
 if __name__ == "__main__":
