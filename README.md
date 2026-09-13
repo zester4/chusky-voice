@@ -285,7 +285,7 @@ Recall recording/transcript retention. A rolling window of up to 32 recent
 utterances/12,000 characters is held in the bridge process for at most 30
 minutes; ambient speech is never written to persistent storage. Only turns
 Chusky answers and its replies are retained in the owner's bounded meeting
-history. Tell participants the AI assistant is joining; the meeting-chat
+history. Tell participants Chusky, the digital assistant, is joining; the meeting-chat
 notice and media page explain live processing and retention. Platform waiting
 rooms and host admission policies still apply. Webex may need workspace-side
 setup.
