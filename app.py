@@ -44,6 +44,7 @@ from audio_formats import (
 from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
 from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, default_meeting_greeting, is_recall_invocation, parse_meeting_media_authorization
+from speech_text import normalize_voice_delta, normalize_voice_text
 
 LOG = logging.getLogger("chusky.voice_bridge")
 logging.basicConfig(level=os.getenv("VOICE_BRIDGE_LOG_LEVEL", "INFO"))
@@ -52,25 +53,6 @@ SAMPLE_RATE = 16_000
 CHANNELS = 1
 BYTES_PER_MS = SAMPLE_RATE * CHANNELS * 2 // 1000
 PCM_CHUNK_BYTES = BYTES_PER_MS * 20
-
-
-def normalize_voice_text(value: str) -> str:
-    """Remove Markdown syntax before text reaches Deepgram TTS or history."""
-    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"```[^\n]*\n?([\s\S]*?)```", r"\1", text)
-    text = re.sub(r"!\[([^\]]*)\]\((https?://[^\s)]+)\)", r"\1: \2", text, flags=re.I)
-    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r"\1: \2", text, flags=re.I)
-    text = re.sub(r"^\s{0,3}#{1,6}\s+", "", text, flags=re.M)
-    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.M)
-    text = re.sub(r"^\s*>\s?", "", text, flags=re.M)
-    text = re.sub(r"^\s*([-*_])(?:\s*\1){2,}\s*$", "", text, flags=re.M)
-    text = re.sub(r"`([^`\n]+)`", r"\1", text)
-    text = re.sub(r"\*\*([^*\n]+)\*\*", r"\1", text)
-    text = re.sub(r"__([^_\n]+)__", r"\1", text)
-    text = re.sub(r"~~([^~\n]+)~~", r"\1", text)
-    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
-    text = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", text)
-    return re.sub(r"\n{3,}", "\n\n", text.replace("*", "").replace("#", "")).strip()
 
 
 @dataclass(frozen=True)
@@ -1319,7 +1301,7 @@ class RecallVoiceSession:
                     if event.get("type") == "delta":
                         if not speaking:
                             continue
-                        delta = normalize_voice_text(str(event.get("text") or ""))
+                        delta = normalize_voice_delta(str(event.get("text") or ""))
                         if not delta:
                             continue
                         received_delta = True
