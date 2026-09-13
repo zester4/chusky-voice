@@ -1552,7 +1552,7 @@ RECALL_MEDIA_UNAVAILABLE_PAGE = """<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Chusky · Digital assistant</title>
+  <title>Chusky</title>
   <style>
     :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; background: #101216; color: #f6f7f9; }
     * { box-sizing: border-box; }
