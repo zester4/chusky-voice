@@ -9,10 +9,9 @@
     :root { color-scheme: dark; font: 16px/1.45 system-ui, sans-serif; background: #101216; color: #f6f7f9; }
     * { box-sizing: border-box; }
     body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: radial-gradient(ellipse at 50% 0%, #282d3b 0, #101216 62%); }
-    main { width: min(92vw, 760px); min-height: 400px; padding: 48px; display: grid; align-content: center; justify-items: center; gap: 20px; border: 1px solid #333947; border-radius: 26px; background: linear-gradient(145deg, #1d222d, #15181f); box-shadow: 0 28px 90px #0008; text-align: center; }
-    .mark { width: 76px; height: 76px; display: grid; place-items: center; border-radius: 24px; color: #d8ddff; background: linear-gradient(140deg, #665be8, #4176d8); font-size: 28px; font-weight: 750; letter-spacing: -.06em; }
-    h1 { margin: 0; font-size: clamp(30px, 4vw, 44px); letter-spacing: -.04em; }
-    p { max-width: 42ch; margin: 0; color: #b4bbcb; }
+    main { width: min(92vw, 760px); min-height: 400px; padding: 42px; display: grid; align-content: center; justify-items: center; gap: 18px; border: 1px solid #333947; border-radius: 26px; background: linear-gradient(145deg, #1d222d, #15181f); box-shadow: 0 28px 90px #0008; text-align: center; }
+    .profile { width: clamp(144px, 24vw, 220px); aspect-ratio: 1; display: block; border: 1px solid #ffffff24; border-radius: 50%; object-fit: cover; box-shadow: 0 12px 40px #0007; }
+    h1 { margin: 0; font-size: clamp(28px, 4vw, 40px); letter-spacing: -.04em; }
     #status { margin-top: 12px; padding: 8px 13px; border-radius: 999px; background: #252b37; color: #c6d0e3; font-size: 13px; }
     #status[data-state="ready"] { color: #8ce4b0; }
     #status[data-state="error"] { color: #ffaaa4; }
@@ -20,9 +19,8 @@
 </head>
 <body>
   <main aria-label="Chusky meeting participant">
-    <div class="mark" aria-hidden="true">C</div>
+    <img class="profile" src="https://chusky-web.vercel.app/chusky/chusky-profile.jpg" alt="Chusky, the AI meeting participant" referrerpolicy="no-referrer" fetchpriority="high">
     <h1>Chusky</h1>
-    <p>Chusky is an AI participant. Live audio is processed to enable conversation; Recall recording and transcript retention are off. A short rolling text window stays in memory during the call so Chusky can follow context. Ambient speech is not saved; only turns Chusky answers and its replies may be retained in the owner’s private Chusky history. Chusky follows the conversation and joins in when useful. You can address it by name or ask it to leave.</p>
     <div id="status" role="status" aria-live="polite" data-state="connecting">Connecting securely…</div>
   </main>
   <script>
