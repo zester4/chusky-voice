@@ -36,6 +36,7 @@ from audio_formats import (
     deepgram_linear16_to_twilio_mulaw,
     deepgram_flux_listen_url,
     deepgram_flux_speak_url,
+    deepgram_nova_listen_url,
     twilio_deepgram_listen_url,
     twilio_deepgram_speak_url,
     twilio_mulaw_to_deepgram_linear16,
@@ -127,6 +128,8 @@ class RecallSettings:
     stt_eager_eot_threshold: float
     stt_eot_threshold: float
     stt_eot_timeout_ms: int
+    nova_endpointing_ms: int
+    nova_utterance_end_ms: int
     tts_model: str
     max_meeting_seconds: int
     max_active_meetings: int
@@ -135,29 +138,52 @@ class RecallSettings:
     @classmethod
     def from_env(cls) -> "RecallSettings":
         if os.getenv("RECALL_MEETINGS_ENABLED", "false").strip().lower() != "true":
-            raise RuntimeError("Recall meeting support is disabled")
+            raise RecallConfigurationError("meetings_disabled", ("RECALL_MEETINGS_ENABLED",))
         secret = os.getenv("RECALL_MEDIA_BRIDGE_SECRET", "").strip()
         deepgram = os.getenv("DEEPGRAM_API_KEY", "").strip()
         turn_url = os.getenv("CHUSKY_RECALL_TURN_STREAM_URL", "").strip()
         commit_url = os.getenv("CHUSKY_RECALL_COMMIT_TURN_URL", "").strip()
         authorize_url = os.getenv("CHUSKY_RECALL_MEDIA_AUTHORIZE_URL", "").strip()
-        endpoints = (turn_url, commit_url, authorize_url)
-        if len(secret.encode("utf-8")) < 32 or not deepgram or any(not url.startswith("https://") for url in endpoints):
-            raise RuntimeError("Recall media bridge requires its secret, Deepgram key, and HTTPS Chusky endpoints")
-        stt = os.getenv("VOICE_STT_MODEL", "flux-general-en").strip()
+        invalid_fields = []
+        if len(secret.encode("utf-8")) < 32:
+            invalid_fields.append("RECALL_MEDIA_BRIDGE_SECRET")
+        if not deepgram:
+            invalid_fields.append("DEEPGRAM_API_KEY")
+        for field_name, url in (
+            ("CHUSKY_RECALL_TURN_STREAM_URL", turn_url),
+            ("CHUSKY_RECALL_COMMIT_TURN_URL", commit_url),
+            ("CHUSKY_RECALL_MEDIA_AUTHORIZE_URL", authorize_url),
+        ):
+            if not url.startswith("https://"):
+                invalid_fields.append(field_name)
+        if invalid_fields:
+            raise RecallConfigurationError("required_settings_invalid", tuple(invalid_fields))
+        # Meetings use Nova-3 independently from Twilio's Flux STT path.
+        stt = os.getenv("RECALL_STT_MODEL", "nova-3").strip()
         tts = os.getenv("VOICE_TTS_MODEL", "flux-haley-en").strip()
-        if not stt.startswith("flux-") or not tts.startswith("flux-"):
-            raise RuntimeError("Recall meetings require Deepgram Flux conversational STT and streaming TTS models")
+        if stt not in {"nova-3", "flux-general-en"} or not tts.startswith("flux-"):
+            raise RecallConfigurationError("meeting_models_invalid", ("RECALL_STT_MODEL", "VOICE_TTS_MODEL"))
         return cls(
             secret, deepgram, turn_url, commit_url, authorize_url, stt,
             max(0.3, min(float(os.getenv("VOICE_STT_EAGER_EOT_THRESHOLD", "0.45")), 0.9)),
             max(0.5, min(float(os.getenv("VOICE_STT_EOT_THRESHOLD", "0.65")), 0.9)),
             max(500, min(int(os.getenv("VOICE_STT_EOT_TIMEOUT_MS", "800")), 60_000)),
+            max(100, min(int(os.getenv("RECALL_NOVA_ENDPOINTING_MS", "500")), 2_000)),
+            max(1_000, min(int(os.getenv("RECALL_NOVA_UTTERANCE_END_MS", "1000")), 5_000)),
             tts,
             max(60, min(int(os.getenv("RECALL_MAX_MEETING_SECONDS", "7200")), 14_400)),
             max(1, min(int(os.getenv("RECALL_MAX_ACTIVE_MEETINGS", "4")), 20)),
             max(1, min(int(os.getenv("RECALL_COPILOT_MIN_INTERVAL_SECONDS", "4")), 120)),
         )
+
+
+class RecallConfigurationError(RuntimeError):
+    """Safe configuration issue code and field names; never retain setting values."""
+
+    def __init__(self, code: str, fields: tuple[str, ...] = ()) -> None:
+        super().__init__(code)
+        self.code = code
+        self.fields = fields
 
 
 class AgoraCredentials(BaseModel):
@@ -972,6 +998,7 @@ class RecallVoiceSession:
         self.response_started_at = 0.0
         self.interrupted = False
         self.turn_index = 0
+        self.nova_final_segments: list[str] = []
 
     async def _send_text(self, payload: dict[str, Any]) -> None:
         async with self.send_lock:
@@ -982,14 +1009,21 @@ class RecallVoiceSession:
             await self.websocket.send_bytes(payload)
 
     async def run(self) -> None:
-        if not self.settings.stt_model.startswith("flux-") or not self.settings.tts_model.startswith("flux-"):
-            raise RuntimeError("Recall voice requires conversational Flux STT and streaming Flux TTS")
-        stt_url = deepgram_flux_listen_url(
-            self.settings.stt_model,
-            self.settings.stt_eager_eot_threshold,
-            self.settings.stt_eot_threshold,
-            self.settings.stt_eot_timeout_ms,
-        )
+        if not self.settings.tts_model.startswith("flux-"):
+            raise RuntimeError("Recall voice requires a Flux streaming TTS model")
+        if self.settings.stt_model == "nova-3":
+            stt_url = deepgram_nova_listen_url(
+                self.settings.stt_model,
+                self.settings.nova_endpointing_ms,
+                self.settings.nova_utterance_end_ms,
+            )
+        else:
+            stt_url = deepgram_flux_listen_url(
+                self.settings.stt_model,
+                self.settings.stt_eager_eot_threshold,
+                self.settings.stt_eot_threshold,
+                self.settings.stt_eot_timeout_ms,
+            )
         tts_url = deepgram_flux_speak_url(self.settings.tts_model)
         tasks: set[asyncio.Task[Any]] = set()
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as self.http:
@@ -1096,6 +1130,35 @@ class RecallVoiceSession:
                 event = json.loads(raw)
             except json.JSONDecodeError:
                 continue
+            if event.get("type") == "Results" and self.settings.stt_model == "nova-3":
+                channel = event.get("channel")
+                alternatives = channel.get("alternatives") if isinstance(channel, dict) else None
+                alternative = alternatives[0] if isinstance(alternatives, list) and alternatives and isinstance(alternatives[0], dict) else {}
+                transcript = normalize_voice_text(str(alternative.get("transcript") or ""))[:5000]
+                if transcript and not bool(event.get("is_final")):
+                    # Nova emits SpeechStarted without transcript content. Use
+                    # interim text to interrupt only a real participant, not
+                    # Chusky's own echoed Output Media.
+                    if self.response_task and not self.response_task.done() and not self.echo_guard.is_echo(transcript):
+                        await self._interrupt()
+                    continue
+                if transcript and bool(event.get("is_final")):
+                    if not self.nova_final_segments or self.nova_final_segments[-1] != transcript:
+                        self.nova_final_segments.append(transcript)
+                if bool(event.get("speech_final")):
+                    final_transcript = normalize_voice_text(" ".join(self.nova_final_segments))[:5000]
+                    self.nova_final_segments.clear()
+                    if final_transcript:
+                        await self._handle_final_stt_turn(final_transcript)
+                continue
+            if event.get("type") == "UtteranceEnd" and self.settings.stt_model == "nova-3":
+                # UtteranceEnd is a server-side gap-detection fallback for
+                # noisy meetings where audio VAD cannot produce speech_final.
+                final_transcript = normalize_voice_text(" ".join(self.nova_final_segments))[:5000]
+                self.nova_final_segments.clear()
+                if final_transcript:
+                    await self._handle_final_stt_turn(final_transcript)
+                continue
             if event.get("type") != "TurnInfo":
                 continue
             turn_event = str(event.get("event") or "")
@@ -1111,29 +1174,33 @@ class RecallVoiceSession:
                 elif is_recall_invocation(transcript):
                     await self._interrupt()
             elif turn_event == "EndOfTurn" and transcript:
-                self.metrics.stt_final_turns += 1
-                if self.echo_guard.is_echo(transcript):
-                    self.metrics.turns_suppressed += 1
-                    continue
-                invoked = is_recall_invocation(transcript)
-                context = self.context.snapshot()
-                self.context.add("participant", transcript)
-                should_evaluate = invoked
-                if self.interaction_mode in ("copilot", "representative"):
-                    should_evaluate = self.copilot_gate.should_evaluate(invoked)
-                elif not invoked:
-                    should_evaluate = False
-                if not should_evaluate:
-                    self.metrics.turns_suppressed += 1
-                    continue
-                self.turn_index += 1
-                self.metrics.agent_requests += 1
-                if self.response_task and not self.response_task.done():
-                    await self._interrupt()
-                self.interrupted = False
-                self.response_started_at = time.monotonic()
-                self.response_task = asyncio.create_task(self._respond(transcript, self.turn_index, context), name=f"recall-response-{self.meeting_id}-{self.turn_index}")
-                self.response_task.add_done_callback(self._observe_response)
+                await self._handle_final_stt_turn(transcript)
+
+    async def _handle_final_stt_turn(self, transcript: str) -> None:
+        """Send one completed Flux or Nova utterance through the same policy."""
+        self.metrics.stt_final_turns += 1
+        if self.echo_guard.is_echo(transcript):
+            self.metrics.turns_suppressed += 1
+            return
+        invoked = is_recall_invocation(transcript)
+        context = self.context.snapshot()
+        self.context.add("participant", transcript)
+        should_evaluate = invoked
+        if self.interaction_mode in ("copilot", "representative"):
+            should_evaluate = self.copilot_gate.should_evaluate(invoked)
+        elif not invoked:
+            should_evaluate = False
+        if not should_evaluate:
+            self.metrics.turns_suppressed += 1
+            return
+        self.turn_index += 1
+        self.metrics.agent_requests += 1
+        if self.response_task and not self.response_task.done():
+            await self._interrupt()
+        self.interrupted = False
+        self.response_started_at = time.monotonic()
+        self.response_task = asyncio.create_task(self._respond(transcript, self.turn_index, context), name=f"recall-response-{self.meeting_id}-{self.turn_index}")
+        self.response_task.add_done_callback(self._observe_response)
 
     def _observe_response(self, task: asyncio.Task[None]) -> None:
         try:
@@ -1481,25 +1548,63 @@ async def recall_health() -> dict[str, Any]:
     try:
         RecallSettings.from_env()
         return {"ok": True, "provider": "recall", "status": "configured", "metrics": recall_metrics.snapshot(len(recall_meetings.active))}
+    except RecallConfigurationError as exc:
+        enabled = os.getenv("RECALL_MEETINGS_ENABLED", "false").strip().lower() == "true"
+        return {"ok": not enabled, "provider": "recall", "status": "misconfigured" if enabled else "disabled", "configurationIssue": exc.code, "metrics": recall_metrics.snapshot(len(recall_meetings.active))}
     except RuntimeError:
         enabled = os.getenv("RECALL_MEETINGS_ENABLED", "false").strip().lower() == "true"
-        return {"ok": not enabled, "provider": "recall", "status": "misconfigured" if enabled else "disabled", "metrics": recall_metrics.snapshot(len(recall_meetings.active))}
+        return {"ok": not enabled, "provider": "recall", "status": "misconfigured" if enabled else "disabled", "configurationIssue": "invalid_configuration", "metrics": recall_metrics.snapshot(len(recall_meetings.active))}
+
+
+RECALL_MEDIA_SECURITY_HEADERS = {
+    "Cache-Control": "no-store, max-age=0",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "Permissions-Policy": "camera=(), microphone=(self)",
+    "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; connect-src 'self' wss:; worker-src blob:; media-src blob:; img-src data: https://chusky-web.vercel.app; base-uri 'none'; form-action 'none'; frame-ancestors 'self' https://*.recall.ai",
+}
+
+RECALL_MEDIA_UNAVAILABLE_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Chusky · Digital assistant</title>
+  <style>
+    :root { color-scheme: dark; font: 16px/1.5 system-ui, sans-serif; background: #101216; color: #f6f7f9; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; background: #101216; }
+    main { width: min(100%, 680px); padding: 40px 28px; display: grid; justify-items: center; gap: 14px; border: 1px solid #333947; border-radius: 22px; background: #191d25; text-align: center; }
+    img { width: 144px; aspect-ratio: 1; border-radius: 50%; object-fit: cover; }
+    h1, p { margin: 0; }
+    .role { color: #bdc7d8; }
+    .status { margin-top: 8px; max-width: 48ch; color: #ffaaa4; }
+  </style>
+</head>
+<body><main aria-label="Chusky meeting participant">
+  <img src="https://chusky-web.vercel.app/chusky/chusky-profile.jpg" alt="Chusky, a digital assistant" referrerpolicy="no-referrer">
+  <h1>Chusky</h1><p class="role">Digital assistant</p>
+  <p class="status" role="status">Meeting audio is temporarily unavailable. Please ask the meeting host to rejoin Chusky.</p>
+</main></body>
+</html>"""
 
 
 @app.get("/recall/media", response_class=HTMLResponse)
 async def recall_media_page() -> HTMLResponse:
     try:
-        RecallSettings.from_env()
         page = Path(__file__).with_name("recall_media.html").read_text("utf-8")
-    except (RuntimeError, OSError):
-        return HTMLResponse("Meeting assistant unavailable", status_code=503, headers={"Cache-Control": "no-store"})
-    return HTMLResponse(page, headers={
-        "Cache-Control": "no-store, max-age=0",
-        "Referrer-Policy": "no-referrer",
-        "X-Content-Type-Options": "nosniff",
-        "Permissions-Policy": "camera=(), microphone=(self)",
-        "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline' blob:; style-src 'unsafe-inline'; connect-src 'self' wss:; worker-src blob:; media-src blob:; img-src data:; base-uri 'none'; form-action 'none'; frame-ancestors 'self' https://*.recall.ai",
-    })
+    except OSError as exc:
+        # Keep the failure visible inside the meeting and diagnose it without
+        # logging filesystem paths, environment values, or provider data.
+        LOG.error(
+            "Recall media page asset unavailable",
+            extra={"stage": "media_page_asset", "reason": "read_failed", "error_type": type(exc).__name__},
+        )
+        return HTMLResponse(RECALL_MEDIA_UNAVAILABLE_PAGE, status_code=503, headers=RECALL_MEDIA_SECURITY_HEADERS)
+    # This branded shell is static and safe to serve even if audio settings are
+    # incomplete; the authenticated websocket owns configuration validation.
+    return HTMLResponse(page, headers=RECALL_MEDIA_SECURITY_HEADERS)
 
 
 @app.websocket("/recall/audio")
@@ -1599,9 +1704,16 @@ async def recall_audio(websocket: WebSocket) -> None:
         error_type = type(exc).__name__
         response = getattr(exc, "response", None)
         http_status = getattr(response, "status_code", None)
+        configuration_fields = getattr(exc, "fields", ())
         LOG.warning(
             "Recall media session could not be initialized",
-            extra={"stage": stage, "error_type": error_type, **({"http_status": http_status} if http_status else {})},
+            extra={
+                "stage": stage,
+                "error_type": error_type,
+                **({"configuration_issue": exc.code} if isinstance(exc, RecallConfigurationError) else {}),
+                **({"configuration_fields": list(configuration_fields)} if configuration_fields else {}),
+                **({"http_status": http_status} if http_status else {}),
+            },
         )
         try:
             await websocket.close(code=1011, reason="voice_service_unavailable")

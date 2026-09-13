@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Chusky</title>
+  <title>Chusky · Digital assistant</title>
   <style>
     :root { color-scheme: dark; font: 16px/1.45 system-ui, sans-serif; background: #101216; color: #f6f7f9; }
     * { box-sizing: border-box; }
@@ -12,6 +12,7 @@
     main { width: min(92vw, 760px); min-height: 400px; padding: 42px; display: grid; align-content: center; justify-items: center; gap: 18px; border: 1px solid #333947; border-radius: 26px; background: linear-gradient(145deg, #1d222d, #15181f); box-shadow: 0 28px 90px #0008; text-align: center; }
     .profile { width: clamp(144px, 24vw, 220px); aspect-ratio: 1; display: block; border: 1px solid #ffffff24; border-radius: 50%; object-fit: cover; box-shadow: 0 12px 40px #0007; }
     h1 { margin: 0; font-size: clamp(28px, 4vw, 40px); letter-spacing: -.04em; }
+    .role { margin-top: -12px; color: #c6d0e3; font-size: 14px; }
     #status { margin-top: 12px; padding: 8px 13px; border-radius: 999px; background: #252b37; color: #c6d0e3; font-size: 13px; }
     #status[data-state="ready"] { color: #8ce4b0; }
     #status[data-state="error"] { color: #ffaaa4; }
@@ -19,8 +20,9 @@
 </head>
 <body>
   <main aria-label="Chusky meeting participant">
-    <img class="profile" src="https://chusky-web.vercel.app/chusky/chusky-profile.jpg" alt="Chusky, the AI meeting participant" referrerpolicy="no-referrer" fetchpriority="high">
+    <img class="profile" src="https://chusky-web.vercel.app/chusky/chusky-profile.jpg" alt="Chusky, a digital assistant" referrerpolicy="no-referrer" fetchpriority="high">
     <h1>Chusky</h1>
+    <div class="role">Digital assistant</div>
     <div id="status" role="status" aria-live="polite" data-state="connecting">Connecting securely…</div>
   </main>
   <script>
@@ -149,13 +151,14 @@
           if (activeSocket !== socket) return;
           stopPlayback();
           if (closing) { cleanup(); return; }
-          const terminalBridgeFailure = event.code === 1011 && ["bridge_auth_failed", "media_authorization_failed"].includes(event.reason);
+          const terminalBridgeFailure = event.code === 1011 && ["bridge_auth_failed", "media_authorization_failed", "voice_service_unavailable"].includes(event.reason);
           if (event.code === 1008 || terminalBridgeFailure || reconnectAttempts >= 4) {
             let message = "Could not restore meeting audio. Rejoin the meeting to try again.";
             if (event.code === 1008 && event.reason === "invalid_ticket") message = "Secure meeting session could not be verified. Rejoin and check the shared bridge secret.";
             else if (event.code === 1008 && event.reason === "meeting_unavailable") message = "This meeting is no longer active or could not be verified.";
             else if (event.code === 1011 && event.reason === "bridge_auth_failed") message = "Meeting bridge authentication failed. Check that both services use the same bridge secret.";
             else if (event.code === 1011 && event.reason === "media_authorization_failed") message = "Chusky could not verify the meeting with its main service. Check the service URL and logs.";
+            else if (event.code === 1011 && event.reason === "voice_service_unavailable") message = "Meeting audio could not be initialized. Please ask the meeting host to rejoin Chusky.";
             else if (event.code === 1011) message = "Meeting speech service failed to start. Check the voice service logs and Deepgram configuration.";
             else if (event.code === 1013 && event.reason === "meeting_not_ready") message = "Chusky could not confirm that the meeting is live. Check Recall bot status and webhook delivery.";
             setStatus("error", message);
