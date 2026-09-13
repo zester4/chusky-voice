@@ -1,6 +1,7 @@
 """Privacy-conscious turn gating for interactive Recall meeting audio."""
 from __future__ import annotations
 
+import math
 import re
 import time
 from collections import deque
@@ -23,7 +24,7 @@ def parse_meeting_media_authorization(value: Any, fallback_mode: str) -> tuple[M
         fallback_mode = "addressed"
     if value is None:
         return fallback_mode, default_meeting_greeting(fallback_mode)
-    if not isinstance(value, dict) or set(value) != {"interactionMode", "greeting"}:
+    if not isinstance(value, dict) or not {"interactionMode", "greeting"}.issubset(value) or set(value) - {"interactionMode", "greeting", "ttsModel"}:
         raise ValueError("invalid meeting media authorization response")
     mode = value.get("interactionMode")
     greeting = value.get("greeting")
@@ -35,6 +36,18 @@ def parse_meeting_media_authorization(value: Any, fallback_mode: str) -> tuple[M
     if not greeting or len(greeting) > 500 or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", greeting):
         raise ValueError("invalid meeting greeting from authorization service")
     return mode, greeting
+
+
+def parse_meeting_tts_model(value: Any, fallback_model: str) -> str:
+    """Read only a safe Flux model ID from Chusky's authenticated media grant."""
+    if not isinstance(fallback_model, str) or not re.fullmatch(r"flux-[a-z]+-en", fallback_model):
+        raise ValueError("invalid meeting fallback TTS model")
+    if not isinstance(value, dict) or "ttsModel" not in value:
+        return fallback_model
+    model = value.get("ttsModel")
+    if not isinstance(model, str) or not re.fullmatch(r"flux-[a-z]+-en", model):
+        raise ValueError("invalid meeting TTS model from authorization service")
+    return model
 
 
 class CopilotTurnGate:
@@ -61,29 +74,84 @@ class MeetingContextWindow:
         self.max_turns = max(1, min(int(max_turns), 32))
         self.max_chars = max(256, min(int(max_chars), 12_000))
         self.ttl_seconds = max(30, min(int(ttl_seconds), 3_600))
-        self._items: deque[tuple[float, ContextRole, str]] = deque()
+        self._items: deque[tuple[int, float, ContextRole, str, str | None]] = deque()
+        self._next_turn_id = 0
 
     def _prune(self, now: float) -> None:
-        while self._items and now - self._items[0][0] > self.ttl_seconds:
+        while self._items and now - self._items[0][1] > self.ttl_seconds:
             self._items.popleft()
-        while len(self._items) > self.max_turns or sum(len(item[2]) for item in self._items) > self.max_chars:
+        while len(self._items) > self.max_turns or sum(len(item[3]) for item in self._items) > self.max_chars:
             self._items.popleft()
 
-    def add(self, role: ContextRole, text: str, now: float | None = None) -> None:
+    def add(self, role: ContextRole, text: str, now: float | None = None) -> int | None:
         if role not in ("participant", "chusky") or not isinstance(text, str):
-            return
+            return None
         cleaned = re.sub(r"\s+", " ", text).strip()[:1_000]
         if not cleaned:
-            return
+            return None
         timestamp = time.monotonic() if now is None else float(now)
         self._prune(timestamp)
-        self._items.append((timestamp, role, cleaned))
+        self._next_turn_id += 1
+        turn_id = self._next_turn_id
+        self._items.append((turn_id, timestamp, role, cleaned, None))
         self._prune(timestamp)
+        return turn_id
+
+    def set_speaker(self, turn_id: int | None, speaker_name: str | None) -> None:
+        if turn_id is None:
+            return
+        cleaned = re.sub(r"\s+", " ", speaker_name).strip()[:160] if isinstance(speaker_name, str) else ""
+        cleaned = re.sub(r"[\x00-\x1f\x7f]", " ", cleaned).strip()
+        self._items = deque(
+            (item_id, timestamp, role, text, cleaned or None) if item_id == turn_id else (item_id, timestamp, role, text, name)
+            for item_id, timestamp, role, text, name in self._items
+        )
 
     def snapshot(self, now: float | None = None) -> list[dict[str, str]]:
         timestamp = time.monotonic() if now is None else float(now)
         self._prune(timestamp)
-        return [{"role": role, "text": text} for _, role, text in self._items]
+        return [
+            {"role": role, "text": text, **({"speakerName": name} if name else {})}
+            for _, _, role, text, name in self._items
+        ]
+
+
+def flux_turn_time_bounds_ms(stream_started_at: float | None, event: dict[str, Any]) -> tuple[int, int] | None:
+    """Map Deepgram's stream-relative word times to UTC milliseconds for Recall correlation."""
+    if not isinstance(stream_started_at, (int, float)) or isinstance(stream_started_at, bool) or not math.isfinite(stream_started_at) or stream_started_at <= 0:
+        return None
+
+    starts: list[float] = []
+    ends: list[float] = []
+    words = event.get("words")
+    if isinstance(words, list):
+        for word in words:
+            if not isinstance(word, dict):
+                continue
+            start, end = word.get("start"), word.get("end")
+            if (
+                isinstance(start, (int, float)) and not isinstance(start, bool)
+                and isinstance(end, (int, float)) and not isinstance(end, bool)
+                and math.isfinite(start) and math.isfinite(end) and 0 <= start <= end <= 120
+            ):
+                starts.append(float(start))
+                ends.append(float(end))
+
+    if not starts:
+        start, end = event.get("audio_window_start"), event.get("audio_window_end")
+        if not (
+            isinstance(start, (int, float)) and not isinstance(start, bool)
+            and isinstance(end, (int, float)) and not isinstance(end, bool)
+            and math.isfinite(start) and math.isfinite(end) and 0 <= start <= end <= 120
+        ):
+            return None
+        starts, ends = [float(start)], [float(end)]
+
+    start_ms = round(stream_started_at * 1000 + min(starts) * 1000)
+    end_ms = round(stream_started_at * 1000 + max(ends) * 1000)
+    if end_ms <= start_ms or end_ms - start_ms > 120_000:
+        return None
+    return start_ms, end_ms
 
 
 class MeetingEchoGuard:

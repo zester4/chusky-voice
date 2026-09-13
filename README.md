@@ -181,6 +181,9 @@ VOICE_GREETING=Hi, this is Chusky. How can I help?
 
 The bridge uses Deepgram Flux conversational STT (`/v2/listen`) at 48 kHz
 linear16 and streaming Flux TTS (`/v2/speak`) at 24 kHz linear16 for Twilio.
+The authenticated Chusky service may provide the owner's selected Flux voice
+for an individual Twilio call; that choice is bound into the short-lived HMAC
+stream ticket and overrides this environment default for that call only.
 The bridge converts Twilio's 8 kHz μ-law frames to the STT format, and converts
 TTS frames back to Twilio's required 8 kHz μ-law. Resampling state is preserved
 across frames. Upsampling the telephone audio does not restore detail that was
@@ -278,6 +281,11 @@ RECALL_MAX_ACTIVE_MEETINGS=4
 RECALL_COPILOT_MIN_INTERVAL_SECONDS=4
 ```
 
+For meetings, the authenticated media-authorization response can provide that
+owner's selected Flux voice; it overrides `VOICE_TTS_MODEL` for the meeting
+session only. The Telegram `/home` voice menu changes the per-account choice,
+not the bridge-wide environment default.
+
 In the Recall dashboard for the chosen region, register a **Bot Status Change**
 webhook pointing to `https://<chusky-host>/recall/webhook`, then configure its
 `whsec_` signing secret as `RECALL_WEBHOOK_SECRET`. Chusky explicitly disables
@@ -297,7 +305,12 @@ verification secret, and ensure root has Redis, QStash, and its public HTTPS
 the dashboard/Svix secret unless Recall explicitly provides one shared workspace
 secret for both. The root service sends the AI/audio disclosure in supported
 meeting chats and handles `/chusky` commands; this voice service does not need
-any meeting-chat credentials.
+any meeting-chat credentials. The same signed endpoint receives Recall's
+`speech_on`/`speech_off` participant transitions. The voice bridge correlates
+those short-lived transitions with Deepgram word timestamps and uses a name
+only when the timing and live roster identify one participant unambiguously;
+otherwise it responds without guessing. This does not enable Recall transcript
+generation, transcript webhooks, or post-meeting transcript artifacts.
 
 ### Staging smoke test
 
@@ -364,8 +377,9 @@ private memories or account metadata. Only an enabled representative receives
 a Composio session, limited to the owner's exact direct action grants; arbitrary
 Composio discovery/execution remains unavailable. Recall's real-time
 transcription webhooks are intentionally not used for live conversation;
-Chusky uses Output Media and Deepgram Flux with its existing configured voice
-model.
+Chusky uses Output Media, Deepgram's configured STT/TTS models, and only the
+separate Recall participant speech-transition events for cautious live speaker
+attribution.
 
 Twilio remains unchanged and is not routed through Recall. `/recall/health`
 reports only configuration and active-session counts. The media page and all

@@ -5,8 +5,10 @@ from recall_turns import (
     MeetingEchoGuard,
     MeetingContextWindow,
     default_meeting_greeting,
+    flux_turn_time_bounds_ms,
     is_recall_invocation,
     parse_meeting_media_authorization,
+    parse_meeting_tts_model,
 )
 
 
@@ -58,6 +60,35 @@ class MeetingContextWindowTests(unittest.TestCase):
         snapshot = context.snapshot(now=102)
         self.assertEqual(len(snapshot), 1)
         self.assertEqual(snapshot[0]["text"], "b" * 200)
+
+    def test_recall_speaker_label_is_added_to_the_matching_ephemeral_turn_only(self):
+        context = MeetingContextWindow()
+        first = context.add("participant", "What is the next step?", now=100)
+        second = context.add("participant", "Can we meet Friday?", now=101)
+        context.set_speaker(first, "Avery Smith")
+        self.assertEqual(context.snapshot(now=101), [
+            {"role": "participant", "text": "What is the next step?", "speakerName": "Avery Smith"},
+            {"role": "participant", "text": "Can we meet Friday?"},
+        ])
+        context.set_speaker(second, "Morgan Lee")
+        self.assertEqual(context.snapshot(now=101)[1]["speakerName"], "Morgan Lee")
+
+
+class RecallTranscriptTimingTests(unittest.TestCase):
+    def test_flux_word_timestamps_map_to_utc_using_the_first_streamed_audio_frame(self):
+        bounds = flux_turn_time_bounds_ms(1_000.125, {
+            "words": [{"word": "Hello", "start": 1.25, "end": 1.5}, {"word": "Avery", "start": 1.6, "end": 2.0}],
+            "audio_window_start": 0,
+            "audio_window_end": 2.1,
+        })
+        self.assertEqual(bounds, (1_001_375, 1_002_125))
+
+    def test_timing_falls_back_to_flux_audio_window_and_rejects_untrusted_ranges(self):
+        self.assertEqual(flux_turn_time_bounds_ms(100.0, {"audio_window_start": 2, "audio_window_end": 3}), (102_000, 103_000))
+        self.assertIsNone(flux_turn_time_bounds_ms(100.0, {"audio_window_start": 3, "audio_window_end": 2}))
+        self.assertIsNone(flux_turn_time_bounds_ms(100.0, {"words": [{"start": 0, "end": 121}]}))
+        self.assertIsNone(flux_turn_time_bounds_ms(100.0, {"words": [{"start": 1, "end": 1}]}))
+        self.assertIsNone(flux_turn_time_bounds_ms(None, {"audio_window_start": 0, "audio_window_end": 1}))
 
 
 class CopilotTurnGateTests(unittest.TestCase):
@@ -133,6 +164,14 @@ class MeetingAuthorizationPresentationTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 with self.assertRaises(ValueError):
                     parse_meeting_media_authorization(payload, "addressed")
+
+    def test_authorized_meeting_voice_overrides_service_default_safely(self):
+        payload = {"interactionMode": "copilot", "greeting": "Hi, I’m Chusky.", "ttsModel": "flux-hannah-en"}
+        self.assertEqual(parse_meeting_media_authorization(payload, "addressed")[0], "copilot")
+        self.assertEqual(parse_meeting_tts_model(payload, "flux-haley-en"), "flux-hannah-en")
+        self.assertEqual(parse_meeting_tts_model({"interactionMode": "copilot", "greeting": "Hi"}, "flux-haley-en"), "flux-haley-en")
+        with self.assertRaises(ValueError):
+            parse_meeting_tts_model({"ttsModel": "https://attacker.invalid"}, "flux-haley-en")
 
 
 if __name__ == "__main__":

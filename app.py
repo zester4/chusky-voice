@@ -11,10 +11,9 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import deque
-import hashlib
-import hmac
 import json
 import logging
+import math
 import os
 import secrets
 import time
@@ -43,8 +42,9 @@ from audio_formats import (
 )
 from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
-from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, default_meeting_greeting, is_recall_invocation, parse_meeting_media_authorization
+from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, default_meeting_greeting, flux_turn_time_bounds_ms, is_recall_invocation, parse_meeting_media_authorization, parse_meeting_tts_model
 from speech_text import normalize_voice_delta, normalize_voice_text
+from twilio_auth import valid_twilio_ticket
 
 LOG = logging.getLogger("chusky.voice_bridge")
 logging.basicConfig(level=os.getenv("VOICE_BRIDGE_LOG_LEVEL", "INFO"))
@@ -185,20 +185,6 @@ class StartCall(BaseModel):
 
 class CallerAudioObserver:  # Base class is added dynamically after Agora imports.
     pass
-
-
-def valid_twilio_ticket(call_id: str, user_id: int, ticket: str, secret: str) -> bool:
-    """Verify the short-lived HMAC ticket minted by Chusky's signed TwiML route."""
-    try:
-        expires, supplied = ticket.split(".", 1)
-        expires_at = int(expires)
-    except (TypeError, ValueError):
-        return False
-    if expires_at < int(time.time() * 1000) or expires_at > int(time.time() * 1000) + 6 * 60_000:
-        return False
-    payload = f"{call_id}.{user_id}.{expires_at}".encode()
-    expected = hmac.new(secret.encode(), payload, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(supplied, expected)
 
 
 def valid_twilio_websocket(websocket: WebSocket, settings: Settings) -> bool:
@@ -483,9 +469,12 @@ class TwilioVoiceCall:
     converts at the provider boundary to Deepgram's configured 48 kHz input
     and 24 kHz output formats; Chusky remains the sole agent/LLM runtime.
     """
-    def __init__(self, call_id: str, user_id: int, stream_sid: str, websocket: WebSocket, settings: Settings, metrics: "BridgeMetrics") -> None:
+    def __init__(self, call_id: str, user_id: int, stream_sid: str, websocket: WebSocket, settings: Settings, metrics: "BridgeMetrics", tts_model: str | None = None) -> None:
         self.call_id, self.user_id, self.stream_sid = call_id, user_id, stream_sid
         self.websocket, self.settings = websocket, settings
+        if tts_model is not None and not re.fullmatch(r"flux-[a-z]+-en", tts_model):
+            raise ValueError("Twilio TTS voice is invalid")
+        self.tts_model = tts_model or settings.tts_model
         self.metrics = metrics
         # Keep one client alive for the call so successive turns reuse the
         # authenticated connection to Chusky rather than paying a new setup cost.
@@ -722,9 +711,9 @@ class TwilioVoiceCall:
     async def _ensure_persistent_tts(self) -> None:
         if self.tts_socket is not None and self.tts_reader_task and not self.tts_reader_task.done():
             return
-        if not self.settings.tts_model.startswith("flux-"):
+        if not re.fullmatch(r"flux-[a-z]+-en", self.tts_model):
             raise RuntimeError("VOICE_TTS_MODEL must be a Flux streaming model (for example flux-haley-en)")
-        url = twilio_deepgram_speak_url(self.settings.tts_model)
+        url = twilio_deepgram_speak_url(self.tts_model)
         self.tts_socket = await connect(url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000)
         self.tts_resample_state = None
         self.tts_reader_task = asyncio.create_task(self._receive_persistent_tts(), name=f"twilio-tts-{self.call_id}")
@@ -900,9 +889,9 @@ class TwilioVoiceCall:
             self.draft_task, self.draft_transcript, self.draft_turn_index = None, "", None
 
     async def _speak(self, text: str) -> None:
-        if not self.settings.tts_model.startswith("flux-"):
+        if not re.fullmatch(r"flux-[a-z]+-en", self.tts_model):
             raise RuntimeError("VOICE_TTS_MODEL must be a Flux streaming model (for example flux-haley-en)")
-        url = twilio_deepgram_speak_url(self.settings.tts_model)
+        url = twilio_deepgram_speak_url(self.tts_model)
         first_audio_at: float | None = None
         resample_state: object | None = None
         async with connect(url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000) as socket:
@@ -955,11 +944,12 @@ class TwilioVoiceCall:
 class RecallVoiceSession:
     """Interactive meeting audio relay; audio is transient and never persisted."""
 
-    def __init__(self, claims: dict[str, Any], websocket: WebSocket, settings: RecallSettings, recall_metrics: "RecallMetrics", play_intro: bool = True, greeting: str | None = None) -> None:
+    def __init__(self, claims: dict[str, Any], websocket: WebSocket, settings: RecallSettings, recall_metrics: "RecallMetrics", play_intro: bool = True, greeting: str | None = None, tts_model: str | None = None) -> None:
         self.meeting_id = str(claims["meetingId"])
         self.user_id = int(claims["userId"])
         self.websocket = websocket
         self.settings = settings
+        self.tts_model = parse_meeting_tts_model({"ttsModel": tts_model} if tts_model else None, settings.tts_model)
         self.metrics = recall_metrics
         self.play_intro = play_intro
         self.interaction_mode = claims.get("interactionMode", "addressed")
@@ -981,6 +971,10 @@ class RecallVoiceSession:
         self.interrupted = False
         self.turn_index = 0
         self.nova_final_segments: list[str] = []
+        self.nova_final_words: list[dict[str, float]] = []
+        self.nova_final_audio_start: float | None = None
+        self.nova_final_audio_end: float | None = None
+        self.stt_audio_started_at: float | None = None
 
     async def _send_text(self, payload: dict[str, Any]) -> None:
         async with self.send_lock:
@@ -991,7 +985,7 @@ class RecallVoiceSession:
             await self.websocket.send_bytes(payload)
 
     async def run(self) -> None:
-        if not self.settings.tts_model.startswith("flux-"):
+        if not re.fullmatch(r"flux-[a-z]+-en", self.tts_model):
             raise RuntimeError("Recall voice requires a Flux streaming TTS model")
         if self.settings.stt_model == "nova-3":
             stt_url = deepgram_nova_listen_url(
@@ -1006,7 +1000,7 @@ class RecallVoiceSession:
                 self.settings.stt_eot_threshold,
                 self.settings.stt_eot_timeout_ms,
             )
-        tts_url = deepgram_flux_speak_url(self.settings.tts_model)
+        tts_url = deepgram_flux_speak_url(self.tts_model)
         tasks: set[asyncio.Task[Any]] = set()
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0)) as self.http:
             try:
@@ -1100,6 +1094,8 @@ class RecallVoiceSession:
         while not self.stop.is_set():
             frame = await self.audio.get()
             if self.stt_socket is not None:
+                if self.stt_audio_started_at is None:
+                    self.stt_audio_started_at = time.time()
                 await self.stt_socket.send(frame)
 
     async def _receive_stt(self) -> None:
@@ -1117,6 +1113,22 @@ class RecallVoiceSession:
                 alternatives = channel.get("alternatives") if isinstance(channel, dict) else None
                 alternative = alternatives[0] if isinstance(alternatives, list) and alternatives and isinstance(alternatives[0], dict) else {}
                 transcript = normalize_voice_text(str(alternative.get("transcript") or ""))[:5000]
+                words = alternative.get("words")
+                if bool(event.get("is_final")) and isinstance(words, list):
+                    for word in words:
+                        if not isinstance(word, dict):
+                            continue
+                        start, end = word.get("start"), word.get("end")
+                        if len(self.nova_final_words) < 2_500 and isinstance(start, (int, float)) and isinstance(end, (int, float)) and not isinstance(start, bool) and not isinstance(end, bool):
+                            self.nova_final_words.append({"start": float(start), "end": float(end)})
+                try:
+                    segment_start = float(event.get("start"))
+                    segment_end = segment_start + float(event.get("duration"))
+                    if math.isfinite(segment_start) and math.isfinite(segment_end) and segment_start >= 0 and segment_end >= segment_start:
+                        self.nova_final_audio_start = segment_start if self.nova_final_audio_start is None else min(self.nova_final_audio_start, segment_start)
+                        self.nova_final_audio_end = segment_end if self.nova_final_audio_end is None else max(self.nova_final_audio_end, segment_end)
+                except (TypeError, ValueError, OverflowError):
+                    pass
                 if transcript and not bool(event.get("is_final")):
                     # Nova emits SpeechStarted without transcript content. Use
                     # interim text to interrupt only a real participant, not
@@ -1130,16 +1142,30 @@ class RecallVoiceSession:
                 if bool(event.get("speech_final")):
                     final_transcript = normalize_voice_text(" ".join(self.nova_final_segments))[:5000]
                     self.nova_final_segments.clear()
+                    timing = flux_turn_time_bounds_ms(self.stt_audio_started_at, {
+                        "words": self.nova_final_words,
+                        "audio_window_start": self.nova_final_audio_start,
+                        "audio_window_end": self.nova_final_audio_end,
+                    })
+                    self.nova_final_words.clear()
+                    self.nova_final_audio_start = self.nova_final_audio_end = None
                     if final_transcript:
-                        await self._handle_final_stt_turn(final_transcript)
+                        await self._handle_final_stt_turn(final_transcript, *(timing or (None, None)))
                 continue
             if event.get("type") == "UtteranceEnd" and self.settings.stt_model == "nova-3":
                 # UtteranceEnd is a server-side gap-detection fallback for
                 # noisy meetings where audio VAD cannot produce speech_final.
                 final_transcript = normalize_voice_text(" ".join(self.nova_final_segments))[:5000]
                 self.nova_final_segments.clear()
+                timing = flux_turn_time_bounds_ms(self.stt_audio_started_at, {
+                    "words": self.nova_final_words,
+                    "audio_window_start": self.nova_final_audio_start,
+                    "audio_window_end": self.nova_final_audio_end,
+                })
+                self.nova_final_words.clear()
+                self.nova_final_audio_start = self.nova_final_audio_end = None
                 if final_transcript:
-                    await self._handle_final_stt_turn(final_transcript)
+                    await self._handle_final_stt_turn(final_transcript, *(timing or (None, None)))
                 continue
             if event.get("type") != "TurnInfo":
                 continue
@@ -1156,9 +1182,10 @@ class RecallVoiceSession:
                 elif is_recall_invocation(transcript):
                     await self._interrupt()
             elif turn_event == "EndOfTurn" and transcript:
-                await self._handle_final_stt_turn(transcript)
+                timing = flux_turn_time_bounds_ms(self.stt_audio_started_at, event)
+                await self._handle_final_stt_turn(transcript, *(timing or (None, None)))
 
-    async def _handle_final_stt_turn(self, transcript: str) -> None:
+    async def _handle_final_stt_turn(self, transcript: str, turn_started_at_ms: int | None = None, turn_ended_at_ms: int | None = None) -> None:
         """Send one completed Flux or Nova utterance through the same policy."""
         self.metrics.stt_final_turns += 1
         if self.echo_guard.is_echo(transcript):
@@ -1166,7 +1193,7 @@ class RecallVoiceSession:
             return
         invoked = is_recall_invocation(transcript)
         context = self.context.snapshot()
-        self.context.add("participant", transcript)
+        context_turn_id = self.context.add("participant", transcript)
         should_evaluate = invoked
         if self.interaction_mode in ("copilot", "representative"):
             should_evaluate = self.copilot_gate.should_evaluate(invoked)
@@ -1181,7 +1208,7 @@ class RecallVoiceSession:
             await self._interrupt()
         self.interrupted = False
         self.response_started_at = time.monotonic()
-        self.response_task = asyncio.create_task(self._respond(transcript, self.turn_index, context), name=f"recall-response-{self.meeting_id}-{self.turn_index}")
+        self.response_task = asyncio.create_task(self._respond(transcript, self.turn_index, context, context_turn_id, turn_started_at_ms, turn_ended_at_ms), name=f"recall-response-{self.meeting_id}-{self.turn_index}")
         self.response_task.add_done_callback(self._observe_response)
 
     def _observe_response(self, task: asyncio.Task[None]) -> None:
@@ -1268,7 +1295,15 @@ class RecallVoiceSession:
         await self._send_tts(text, flush=True)
         await asyncio.wait_for(self.tts_done_event.wait(), timeout=45.0)
 
-    async def _respond(self, transcript: str, turn_id: int, context: list[dict[str, str]]) -> None:
+    async def _respond(
+        self,
+        transcript: str,
+        turn_id: int,
+        context: list[dict[str, str]],
+        context_turn_id: int | None,
+        turn_started_at_ms: int | None,
+        turn_ended_at_ms: int | None,
+    ) -> None:
         if self.tts_socket is None:
             LOG.warning("Recall meeting response skipped: TTS socket unavailable", extra={"meeting_id": self.meeting_id})
             return
@@ -1285,7 +1320,14 @@ class RecallVoiceSession:
                 "POST",
                 self.settings.turn_stream_url,
                 headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
-                json={"meetingId": self.meeting_id, "userId": self.user_id, "transcript": transcript, "context": context, "interactionMode": self.interaction_mode},
+                json={
+                    "meetingId": self.meeting_id,
+                    "userId": self.user_id,
+                    "transcript": transcript,
+                    "context": context,
+                    "interactionMode": self.interaction_mode,
+                    **({"turnStartedAtMs": turn_started_at_ms, "turnEndedAtMs": turn_ended_at_ms} if turn_started_at_ms is not None and turn_ended_at_ms is not None else {}),
+                },
             ) as response:
                 if response.status_code != 200:
                     LOG.warning(
@@ -1298,7 +1340,9 @@ class RecallVoiceSession:
                     if not line:
                         continue
                     event = json.loads(line)
-                    if event.get("type") == "delta":
+                    if event.get("type") == "speaker":
+                        self.context.set_speaker(context_turn_id, event.get("name"))
+                    elif event.get("type") == "delta":
                         if not speaking:
                             continue
                         delta = normalize_voice_delta(str(event.get("text") or ""))
@@ -1625,18 +1669,21 @@ async def recall_audio(websocket: WebSocket) -> None:
         stage = "media_authorization"
         pending_notified = False
         authorized_meeting: tuple[MeetingMode, str] | None = None
+        authorized_tts_model = settings.tts_model
         async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
             async def check_media_authorization() -> int:
-                nonlocal pending_notified, authorized_meeting
+                nonlocal pending_notified, authorized_meeting, authorized_tts_model
                 response = await client.post(
                     settings.media_authorize_url,
                     headers={"Authorization": f"Bearer {settings.bridge_secret}"},
                     json={"meetingId": claims["meetingId"], "userId": claims["userId"]},
                 )
                 if response.status_code == 200:
+                    authorization_payload = response.json()
                     authorized_meeting = parse_meeting_media_authorization(
-                        response.json(), str(claims.get("interactionMode", "addressed")),
+                        authorization_payload, str(claims.get("interactionMode", "addressed")),
                     )
+                    authorized_tts_model = parse_meeting_tts_model(authorization_payload, settings.tts_model)
                 if response.status_code == 425 and not pending_notified:
                     pending_notified = True
                     recall_metrics.media_authorization_waits += 1
@@ -1676,7 +1723,7 @@ async def recall_audio(websocket: WebSocket) -> None:
         recall_handshakes.release()
         handshake_slot = False
         stage = "voice_session"
-        await RecallVoiceSession(claims, websocket, settings, recall_metrics, play_intro=not bool(auth.get("reconnect")), greeting=greeting).run()
+        await RecallVoiceSession(claims, websocket, settings, recall_metrics, play_intro=not bool(auth.get("reconnect")), greeting=greeting, tts_model=authorized_tts_model).run()
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -1749,13 +1796,15 @@ async def twilio_stream(websocket: WebSocket) -> None:
         except ValueError:
             user_id = 0
         ticket = str(params.get("ticket") or "")
+        tts_model = str(params.get("ttsModel") or "").strip() or None
         stream_sid = str(start.get("streamSid") or start_event.get("streamSid") or "").strip()
         media_format = start.get("mediaFormat") or {}
         if (not call_id.startswith("twc_") or user_id <= 0 or not stream_sid
                 or media_format.get("encoding") != "audio/x-mulaw"
                 or media_format.get("sampleRate") != 8000
                 or media_format.get("channels") != 1
-                or not valid_twilio_ticket(call_id, user_id, ticket, settings.bridge_secret)):
+                or not valid_twilio_ticket(call_id, user_id, ticket, settings.bridge_secret, tts_model)
+                or (tts_model is not None and not re.fullmatch(r"flux-[a-z]+-en", tts_model))):
             await websocket.close(code=1008)
             return
         if not await calls.reserve_twilio(call_id, settings):
@@ -1763,7 +1812,7 @@ async def twilio_stream(websocket: WebSocket) -> None:
             return
         metrics.twilio_started += 1
         try:
-            await TwilioVoiceCall(call_id, user_id, stream_sid, websocket, settings, metrics).run()
+            await TwilioVoiceCall(call_id, user_id, stream_sid, websocket, settings, metrics, tts_model=tts_model).run()
         finally:
             await calls.release_twilio(call_id)
     except (WebSocketDisconnect, asyncio.TimeoutError, json.JSONDecodeError):

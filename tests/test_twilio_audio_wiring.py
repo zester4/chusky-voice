@@ -140,6 +140,26 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
         encoded_payload = media["media"]["payload"]
         self.assertEqual(len(base64.b64decode(encoded_payload)), 160)
 
+    async def test_selected_voice_overrides_bridge_default_for_tts_connection(self):
+        opened_urls = []
+
+        async def fake_connect(url, **_kwargs):
+            opened_urls.append(url)
+            return FakeTtsSocket()
+
+        selected = voice_app.TwilioVoiceCall(
+            "twc_voice", 1, "MZ_voice", self.websocket, self.call.settings,
+            voice_app.BridgeMetrics(), tts_model="flux-hannah-en",
+        )
+        self.addAsyncCleanup(selected.http.aclose)
+        self.addAsyncCleanup(selected._close_persistent_tts)
+        with patch.object(voice_app, "connect", fake_connect):
+            await selected._ensure_persistent_tts()
+            await selected.tts_reader_task
+
+        query = parse_qs(urlparse(opened_urls[0]).query)
+        self.assertEqual(query["model"], ["flux-hannah-en"])
+
 
 if __name__ == "__main__":
     unittest.main()
