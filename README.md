@@ -263,20 +263,20 @@ CHUSKY_RECALL_COMMIT_TURN_URL=https://<chusky-host>/internal/recall/commit-turn
 CHUSKY_RECALL_MEDIA_AUTHORIZE_URL=https://<chusky-host>/internal/recall/media-authorize
 RECALL_MAX_MEETING_SECONDS=7200
 RECALL_MAX_ACTIVE_MEETINGS=4
-RECALL_COPILOT_MIN_INTERVAL_SECONDS=8
-RECALL_COPILOT_MAX_EVALUATIONS=120
+RECALL_COPILOT_MIN_INTERVAL_SECONDS=4
 ```
 
 In the Recall dashboard for the chosen region, register a **Bot Status Change**
 webhook pointing to `https://<chusky-host>/recall/webhook`, then configure its
 `whsec_` signing secret as `RECALL_WEBHOOK_SECRET`. Chusky explicitly disables
-Recall recording/transcript retention. A rolling window of up to 12 recent
-utterances/6,000 characters is held in the bridge process for at most five
+Recall recording/transcript retention. A rolling window of up to 32 recent
+utterances/12,000 characters is held in the bridge process for at most 30
 minutes; ambient speech is never written to persistent storage. Only turns
 Chusky answers and its replies are retained in the owner's bounded meeting
-history. Tell participants the AI assistant is joining; the page and spoken
-intro explain live processing and retention. Platform waiting rooms and host
-admission policies still apply. Webex may need workspace-side setup.
+history. Tell participants the AI assistant is joining; the meeting-chat
+notice and media page explain live processing and retention. Platform waiting
+rooms and host admission policies still apply. Webex may need workspace-side
+setup.
 
 Optional meeting-chat support is configured on the **Chusky root service**,
 not this bridge: set `RECALL_REALTIME_SECRET` to the Recall workspace
@@ -333,20 +333,21 @@ modes. An omitted mode defaults to the enabled representative profile, or to
 proactive copilot when no profile is enabled; choose `addressed` only when the
 owner explicitly wants wake-word-only behavior. The root authorization response
 provides the effective mode and a short spoken introduction to the authenticated
-bridge. Representative greetings use the configured AI role and company name;
-they contain no credentials or private memory. `addressed` calls the model when
+bridge. Chusky's spoken introduction is brief and conversational; a one-time
+meeting-chat notice discloses that it is an AI and explains live processing.
+Company context is used only when the owner has configured a representative
+profile. `addressed` calls the model when
 someone says “Chusky.” Copilot evaluates eligible turns at most once every
 configured interval, speaks only with a `SPEAK` verdict, and stays silent
-otherwise. Representative mode uses the owner's configured company objective,
+otherwise. The interval smooths rapid consecutive turns but does not impose a
+per-meeting turn cap or switch Chusky into wake-word-only mode. Representative mode uses the owner's configured company objective,
 approved knowledge, action allowlist, and account aliases; it is similarly
-budgeted and fails silent when it has no useful contribution. The Chusky root service enforces the configured evaluation limit
-atomically in Redis across bridge reconnects and replicas (default 120 per
-meeting); the voice service's local gate is an optimization only. At the cap it
-falls back to addressed-only while direct wake-word requests continue to work.
-Meeting model calls still count against the owner's normal rate and spend
-limits. Set
-`RECALL_COPILOT_MIN_INTERVAL_SECONDS` and `RECALL_COPILOT_MAX_EVALUATIONS` to
-the same values on both Chusky and `chusky-voice`. Meeting runs never receive
+budgeted and stays quiet when it has no useful contribution. The Chusky root
+service enforces the configured minimum interval atomically in Redis across
+bridge reconnects and replicas; the voice service's local gate is an
+optimization only. Meeting model calls still count against the owner's normal
+rate and spend limits. Set `RECALL_COPILOT_MIN_INTERVAL_SECONDS` to the same
+value on both Chusky and `chusky-voice`. Meeting runs never receive
 private memories or account metadata. Only an enabled representative receives
 a Composio session, limited to the owner's exact direct action grants; arbitrary
 Composio discovery/execution remains unavailable. Recall's real-time

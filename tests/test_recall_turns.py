@@ -3,6 +3,7 @@ import unittest
 from recall_turns import (
     CopilotTurnGate,
     MeetingContextWindow,
+    default_meeting_greeting,
     is_recall_invocation,
     parse_meeting_media_authorization,
 )
@@ -30,6 +31,13 @@ class RecallInvocationTests(unittest.TestCase):
 
 
 class MeetingContextWindowTests(unittest.TestCase):
+    def test_default_context_carries_the_meeting_past_five_minutes(self):
+        context = MeetingContextWindow()
+        context.add("participant", "The agreed launch date is October 12.", now=100)
+        for turn in range(1, 20):
+            context.add("participant", f"Meeting discussion {turn}.", now=100 + turn * 20)
+        self.assertEqual(context.snapshot(now=700)[0]["text"], "The agreed launch date is October 12.")
+
     def test_keeps_only_bounded_recent_context_and_drops_expired_speech(self):
         context = MeetingContextWindow(max_turns=2, max_chars=256, ttl_seconds=30)
         context.add("participant", "first", now=100)
@@ -52,13 +60,20 @@ class MeetingContextWindowTests(unittest.TestCase):
 
 
 class CopilotTurnGateTests(unittest.TestCase):
-    def test_proactive_turns_are_rate_and_count_limited_but_direct_requests_remain_available(self):
-        gate = CopilotTurnGate(min_interval_seconds=8, max_evaluations=2)
-        self.assertEqual(gate.should_evaluate(False, now=100), (True, False))
-        self.assertEqual(gate.should_evaluate(False, now=105), (False, False))
-        self.assertEqual(gate.should_evaluate(False, now=108), (True, False))
-        self.assertEqual(gate.should_evaluate(False, now=120), (False, True))
-        self.assertEqual(gate.should_evaluate(True, now=120), (True, False))
+    def test_proactive_participation_does_not_expire_after_a_fixed_number_of_turns(self):
+        gate = CopilotTurnGate(min_interval_seconds=1)
+        self.assertTrue(gate.should_evaluate(False, now=100))
+        self.assertFalse(gate.should_evaluate(False, now=100.5))
+        for turn in range(1, 401):
+            self.assertTrue(gate.should_evaluate(False, now=100 + turn))
+
+
+class MeetingConversationDefaultsTests(unittest.TestCase):
+    def test_default_join_opens_with_a_natural_brief_introduction(self):
+        self.assertEqual(
+            default_meeting_greeting("copilot"),
+            "Hi everyone, I’m Chusky. I’ll follow along and join in when I can help.",
+        )
 
 
 class MeetingAuthorizationPresentationTests(unittest.TestCase):
@@ -76,10 +91,10 @@ class MeetingAuthorizationPresentationTests(unittest.TestCase):
     def test_old_authorization_response_uses_short_mode_appropriate_greeting(self):
         mode, greeting = parse_meeting_media_authorization(None, "addressed")
         self.assertEqual(mode, "addressed")
-        self.assertIn("Say ‘Chusky’", greeting)
+        self.assertIn("say my name", greeting.lower())
         mode, greeting = parse_meeting_media_authorization(None, "copilot")
         self.assertEqual(mode, "copilot")
-        self.assertIn("speak up when I can add something useful", greeting)
+        self.assertIn("join in when I can help", greeting)
 
     def test_rejects_malformed_authorized_mode_or_unbounded_greeting(self):
         for payload in (

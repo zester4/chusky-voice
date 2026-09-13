@@ -13,8 +13,8 @@ MeetingMode = Literal["addressed", "copilot", "representative"]
 
 def default_meeting_greeting(mode: str) -> str:
     if mode == "addressed":
-        return "Hi everyone, I’m Chusky, the AI meeting assistant. Say ‘Chusky’ when you’d like me to respond."
-    return "Hi everyone, I’m Chusky, the AI meeting copilot. I’ll follow the conversation and speak up when I can add something useful; you can address me directly anytime."
+        return "Hi everyone, I’m Chusky. Say my name if you’d like me to jump in."
+    return "Hi everyone, I’m Chusky. I’ll follow along and join in when I can help."
 
 
 def parse_meeting_media_authorization(value: Any, fallback_mode: str) -> tuple[MeetingMode, str]:
@@ -38,34 +38,29 @@ def parse_meeting_media_authorization(value: Any, fallback_mode: str) -> tuple[M
 
 
 class CopilotTurnGate:
-    """Rate- and count-limit proactive model evaluations; explicit calls bypass the copilot cap."""
+    """Smooth bursts without timing out autonomous participation during a meeting."""
 
-    def __init__(self, min_interval_seconds: int = 8, max_evaluations: int = 120) -> None:
-        self.min_interval_seconds = max(5, min(int(min_interval_seconds), 120))
-        self.max_evaluations = max(1, min(int(max_evaluations), 1_000))
+    def __init__(self, min_interval_seconds: int = 4) -> None:
+        self.min_interval_seconds = max(1, min(int(min_interval_seconds), 120))
         self.last_evaluation_at = float("-inf")
-        self.evaluations = 0
 
-    def should_evaluate(self, invoked: bool, now: float | None = None) -> tuple[bool, bool]:
+    def should_evaluate(self, invoked: bool, now: float | None = None) -> bool:
         if invoked:
-            return True, False
+            return True
         timestamp = time.monotonic() if now is None else float(now)
-        if self.evaluations >= self.max_evaluations:
-            return False, True
         if timestamp - self.last_evaluation_at < self.min_interval_seconds:
-            return False, False
+            return False
         self.last_evaluation_at = timestamp
-        self.evaluations += 1
-        return True, False
+        return True
 
 
 class MeetingContextWindow:
     """Small in-process transcript window; never writes ambient speech to storage."""
 
-    def __init__(self, max_turns: int = 12, max_chars: int = 6_000, ttl_seconds: int = 300) -> None:
+    def __init__(self, max_turns: int = 32, max_chars: int = 12_000, ttl_seconds: int = 1_800) -> None:
         self.max_turns = max(1, min(int(max_turns), 32))
         self.max_chars = max(256, min(int(max_chars), 12_000))
-        self.ttl_seconds = max(30, min(int(ttl_seconds), 900))
+        self.ttl_seconds = max(30, min(int(ttl_seconds), 3_600))
         self._items: deque[tuple[float, ContextRole, str]] = deque()
 
     def _prune(self, now: float) -> None:

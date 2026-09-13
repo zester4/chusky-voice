@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Chusky Meeting Assistant</title>
+  <title>Chusky</title>
   <style>
     :root { color-scheme: dark; font: 16px/1.45 system-ui, sans-serif; background: #101216; color: #f6f7f9; }
     * { box-sizing: border-box; }
@@ -19,10 +19,10 @@
   </style>
 </head>
 <body>
-  <main aria-label="Chusky Meeting Assistant">
+  <main aria-label="Chusky meeting participant">
     <div class="mark" aria-hidden="true">C</div>
-    <h1>Chusky Meeting Assistant</h1>
-    <p>An AI participant. Live audio is processed by Chusky’s speech and AI services. A short rolling text window stays in memory during the call so Chusky can follow context; ambient speech is not saved. Only turns Chusky answers and its replies may be retained in the meeting owner’s private Chusky history. Say “Chusky” to address it.</p>
+    <h1>Chusky</h1>
+    <p>Chusky is an AI participant. Live audio is processed to enable conversation; Recall recording and transcript retention are off. A short rolling text window stays in memory during the call so Chusky can follow context. Ambient speech is not saved; only turns Chusky answers and its replies may be retained in the owner’s private Chusky history. Chusky follows the conversation and joins in when useful. You can address it by name or ask it to leave.</p>
     <div id="status" role="status" aria-live="polite" data-state="connecting">Connecting securely…</div>
   </main>
   <script>
@@ -118,9 +118,7 @@
               reconnectAttempts = 0;
               const modeLabel = message.interactionMode === "addressed"
                 ? "Connected · say ‘Chusky’ to speak"
-                : message.interactionMode === "representative"
-                  ? "Connected · company representative listening"
-                  : "Connected · AI copilot listening";
+                : "Connected · joining the conversation";
               setStatus("ready", modeLabel);
             } catch {
               setStatus("error", "Could not start secure meeting audio.");
@@ -129,8 +127,6 @@
             }
           } else if (message.type === "clear") {
             stopPlayback();
-          } else if (message.type === "mode" && message.reason === "copilot_limit") {
-            setStatus("ready", "Proactive listening paused · say Chusky to continue");
           } else if (message.type === "status" && message.code === "meeting_not_ready") {
             setStatus("connecting", "Waiting for Chusky to be admitted to the meeting…");
           } else if (message.type === "error") {

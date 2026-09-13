@@ -131,7 +131,6 @@ class RecallSettings:
     max_meeting_seconds: int
     max_active_meetings: int
     copilot_min_interval_seconds: int
-    copilot_max_evaluations: int
 
     @classmethod
     def from_env(cls) -> "RecallSettings":
@@ -157,8 +156,7 @@ class RecallSettings:
             tts,
             max(60, min(int(os.getenv("RECALL_MAX_MEETING_SECONDS", "7200")), 14_400)),
             max(1, min(int(os.getenv("RECALL_MAX_ACTIVE_MEETINGS", "4")), 20)),
-            max(5, min(int(os.getenv("RECALL_COPILOT_MIN_INTERVAL_SECONDS", "8")), 120)),
-            max(1, min(int(os.getenv("RECALL_COPILOT_MAX_EVALUATIONS", "120")), 1_000)),
+            max(1, min(int(os.getenv("RECALL_COPILOT_MIN_INTERVAL_SECONDS", "4")), 120)),
         )
 
 
@@ -962,7 +960,7 @@ class RecallVoiceSession:
         self.greeting = greeting or default_meeting_greeting(self.interaction_mode)
         self.audio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
         self.context = MeetingContextWindow()
-        self.copilot_gate = CopilotTurnGate(settings.copilot_min_interval_seconds, settings.copilot_max_evaluations)
+        self.copilot_gate = CopilotTurnGate(settings.copilot_min_interval_seconds)
         self.stop = asyncio.Event()
         self.send_lock = asyncio.Lock()
         self.tts_lock = asyncio.Lock()
@@ -973,7 +971,6 @@ class RecallVoiceSession:
         self.response_started_at = 0.0
         self.interrupted = False
         self.turn_index = 0
-        self.copilot_limit_notified = False
 
     async def _send_text(self, payload: dict[str, Any]) -> None:
         async with self.send_lock:
@@ -1115,10 +1112,7 @@ class RecallVoiceSession:
                 self.context.add("participant", transcript)
                 should_evaluate = invoked
                 if self.interaction_mode in ("copilot", "representative"):
-                    should_evaluate, cap_reached = self.copilot_gate.should_evaluate(invoked)
-                    if cap_reached and not self.copilot_limit_notified:
-                        self.copilot_limit_notified = True
-                        await self._send_text({"type": "mode", "mode": "addressed", "reason": "copilot_limit"})
+                    should_evaluate = self.copilot_gate.should_evaluate(invoked)
                 elif not invoked:
                     should_evaluate = False
                 if not should_evaluate:
