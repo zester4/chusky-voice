@@ -4,10 +4,37 @@ from __future__ import annotations
 import re
 import time
 from collections import deque
-from typing import Literal
+from typing import Any, Literal
 
 
 ContextRole = Literal["participant", "chusky"]
+MeetingMode = Literal["addressed", "copilot", "representative"]
+
+
+def default_meeting_greeting(mode: str) -> str:
+    if mode == "addressed":
+        return "Hi everyone, I’m Chusky, the AI meeting assistant. Say ‘Chusky’ when you’d like me to respond."
+    return "Hi everyone, I’m Chusky, the AI meeting copilot. I’ll follow the conversation and speak up when I can add something useful; you can address me directly anytime."
+
+
+def parse_meeting_media_authorization(value: Any, fallback_mode: str) -> tuple[MeetingMode, str]:
+    """Validate the owner-scoped meeting mode and spoken intro from Chusky's authenticated API."""
+    if fallback_mode not in ("addressed", "copilot", "representative"):
+        fallback_mode = "addressed"
+    if value is None:
+        return fallback_mode, default_meeting_greeting(fallback_mode)
+    if not isinstance(value, dict) or set(value) != {"interactionMode", "greeting"}:
+        raise ValueError("invalid meeting media authorization response")
+    mode = value.get("interactionMode")
+    greeting = value.get("greeting")
+    if mode not in ("addressed", "copilot", "representative"):
+        raise ValueError("invalid meeting interaction mode from authorization service")
+    if not isinstance(greeting, str):
+        raise ValueError("invalid meeting greeting from authorization service")
+    greeting = re.sub(r"\s+", " ", greeting).strip()
+    if not greeting or len(greeting) > 500 or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", greeting):
+        raise ValueError("invalid meeting greeting from authorization service")
+    return mode, greeting
 
 
 class CopilotTurnGate:

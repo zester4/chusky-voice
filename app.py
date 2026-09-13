@@ -42,7 +42,7 @@ from audio_formats import (
 )
 from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
-from recall_turns import CopilotTurnGate, MeetingContextWindow, is_recall_invocation
+from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingMode, default_meeting_greeting, is_recall_invocation, parse_meeting_media_authorization
 
 LOG = logging.getLogger("chusky.voice_bridge")
 logging.basicConfig(level=os.getenv("VOICE_BRIDGE_LOG_LEVEL", "INFO"))
@@ -949,7 +949,7 @@ class TwilioVoiceCall:
 class RecallVoiceSession:
     """Interactive meeting audio relay; audio is transient and never persisted."""
 
-    def __init__(self, claims: dict[str, Any], websocket: WebSocket, settings: RecallSettings, recall_metrics: "RecallMetrics", play_intro: bool = True) -> None:
+    def __init__(self, claims: dict[str, Any], websocket: WebSocket, settings: RecallSettings, recall_metrics: "RecallMetrics", play_intro: bool = True, greeting: str | None = None) -> None:
         self.meeting_id = str(claims["meetingId"])
         self.user_id = int(claims["userId"])
         self.websocket = websocket
@@ -959,6 +959,7 @@ class RecallVoiceSession:
         self.interaction_mode = claims.get("interactionMode", "addressed")
         if self.interaction_mode not in ("addressed", "copilot", "representative"):
             raise RuntimeError("Recall meeting interaction mode is invalid")
+        self.greeting = greeting or default_meeting_greeting(self.interaction_mode)
         self.audio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
         self.context = MeetingContextWindow()
         self.copilot_gate = CopilotTurnGate(settings.copilot_min_interval_seconds, settings.copilot_max_evaluations)
@@ -1059,11 +1060,7 @@ class RecallVoiceSession:
                     ready = True
                     self.metrics.browser_ready += 1
                     if self.play_intro and self.response_task is None:
-                        if self.interaction_mode in ("copilot", "representative"):
-                            intro = "Hi, I’m Chusky, a disclosed AI meeting participant. I process live speech and may speak when I can help. A short text window is held in memory during this call; it is not saved. Address me by name whenever you want to ask something. Only turns I answer and my replies may be saved in the meeting owner’s private Chusky history."
-                        else:
-                            intro = "Hi, I’m Chusky, an AI assistant. I process live speech to understand requests. A short text window is held in memory during this call; it is not saved. Say ‘Chusky’ when you’d like me to respond. Only direct questions to me and my replies may be saved in the meeting owner’s private Chusky history."
-                        self.response_task = asyncio.create_task(self._speak(intro), name=f"recall-intro-{self.meeting_id}")
+                        self.response_task = asyncio.create_task(self._speak(self.greeting), name=f"recall-intro-{self.meeting_id}")
                         self.response_task.add_done_callback(self._observe_response)
                 continue
             audio = event.get("bytes")
@@ -1533,14 +1530,19 @@ async def recall_audio(websocket: WebSocket) -> None:
         # This prevents pre-join use and replay after the meeting ends.
         stage = "media_authorization"
         pending_notified = False
+        authorized_meeting: tuple[MeetingMode, str] | None = None
         async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
             async def check_media_authorization() -> int:
-                nonlocal pending_notified
+                nonlocal pending_notified, authorized_meeting
                 response = await client.post(
                     settings.media_authorize_url,
                     headers={"Authorization": f"Bearer {settings.bridge_secret}"},
                     json={"meetingId": claims["meetingId"], "userId": claims["userId"]},
                 )
+                if response.status_code == 200:
+                    authorized_meeting = parse_meeting_media_authorization(
+                        response.json(), str(claims.get("interactionMode", "addressed")),
+                    )
                 if response.status_code == 425 and not pending_notified:
                     pending_notified = True
                     recall_metrics.media_authorization_waits += 1
@@ -1548,7 +1550,7 @@ async def recall_audio(websocket: WebSocket) -> None:
                 return response.status_code
 
             authorization_status = await wait_for_media_authorization(check_media_authorization, timeout_seconds=15.0)
-        if authorization_status != 204:
+        if authorization_status not in (200, 204):
             if authorization_status == 425:
                 recall_metrics.media_authorization_timeouts += 1
                 LOG.warning("Recall media authorization timed out waiting for active meeting", extra={"stage": stage, "http_status": 425})
@@ -1566,6 +1568,10 @@ async def recall_audio(websocket: WebSocket) -> None:
                 LOG.warning("Recall media authorization service rejected request", extra={"stage": stage, "http_status": authorization_status})
                 await websocket.close(code=1011, reason="media_authorization_failed")
             return
+        if authorized_meeting is None:
+            authorized_meeting = parse_meeting_media_authorization(None, str(claims.get("interactionMode", "addressed")))
+        claims["interactionMode"] = authorized_meeting[0]
+        greeting = authorized_meeting[1]
         stage = "meeting_capacity"
         if not await recall_meetings.reserve(claims["meetingId"], settings.max_active_meetings):
             await websocket.close(code=1013)
@@ -1576,7 +1582,7 @@ async def recall_audio(websocket: WebSocket) -> None:
         recall_handshakes.release()
         handshake_slot = False
         stage = "voice_session"
-        await RecallVoiceSession(claims, websocket, settings, recall_metrics, play_intro=not bool(auth.get("reconnect"))).run()
+        await RecallVoiceSession(claims, websocket, settings, recall_metrics, play_intro=not bool(auth.get("reconnect")), greeting=greeting).run()
     except WebSocketDisconnect:
         pass
     except Exception as exc:

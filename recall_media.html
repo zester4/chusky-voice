@@ -116,7 +116,12 @@
               if (activeSocket !== socket || activeSocket.readyState !== WebSocket.OPEN) return;
               activeSocket.send(JSON.stringify({ type: "ready", sampleRate: context.sampleRate }));
               reconnectAttempts = 0;
-              setStatus("ready", message.interactionMode === "addressed" ? "Connected · say ‘Chusky’ to speak" : "Connected · listening for opportunities");
+              const modeLabel = message.interactionMode === "addressed"
+                ? "Connected · say ‘Chusky’ to speak"
+                : message.interactionMode === "representative"
+                  ? "Connected · company representative listening"
+                  : "Connected · AI copilot listening";
+              setStatus("ready", modeLabel);
             } catch {
               setStatus("error", "Could not start secure meeting audio.");
               closing = true;
@@ -125,7 +130,7 @@
           } else if (message.type === "clear") {
             stopPlayback();
           } else if (message.type === "mode" && message.reason === "copilot_limit") {
-            setStatus("ready", "Copilot limit reached · say Chusky to continue");
+            setStatus("ready", "Proactive listening paused · say Chusky to continue");
           } else if (message.type === "status" && message.code === "meeting_not_ready") {
             setStatus("connecting", "Waiting for Chusky to be admitted to the meeting…");
           } else if (message.type === "error") {
