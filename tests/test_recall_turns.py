@@ -2,6 +2,7 @@ import unittest
 
 from recall_turns import (
     CopilotTurnGate,
+    MeetingEchoGuard,
     MeetingContextWindow,
     default_meeting_greeting,
     is_recall_invocation,
@@ -66,6 +67,33 @@ class CopilotTurnGateTests(unittest.TestCase):
         self.assertFalse(gate.should_evaluate(False, now=100.5))
         for turn in range(1, 401):
             self.assertTrue(gate.should_evaluate(False, now=100 + turn))
+
+
+class MeetingEchoGuardTests(unittest.TestCase):
+    def test_suppresses_recent_complete_or_chunked_chusky_speech(self):
+        guard = MeetingEchoGuard()
+        guard.remember_output("I can send the onboarding checklist after this meeting.", now=100)
+        self.assertTrue(guard.is_echo("I can send the onboarding checklist after this meeting", now=104))
+
+        guard.remember_output("Hi everyone, I’m Chusky. I’ll follow along and join in when I can help.", now=150)
+        self.assertTrue(guard.is_echo("Hi everyone, I’m Chusky", now=151), "partial STT must not interrupt Chusky's greeting")
+
+        guard.remember_output("The next step is to confirm the launch date", now=200)
+        guard.remember_output("and assign an implementation owner.", now=201)
+        self.assertTrue(guard.is_echo("The next step is to confirm the launch date and assign an implementation owner", now=203))
+
+    def test_keeps_new_participant_speech_and_expires_old_output(self):
+        guard = MeetingEchoGuard()
+        guard.remember_output("I can book a follow-up meeting for Thursday afternoon.", now=100)
+        self.assertFalse(guard.is_echo("Chusky, please do not book that yet", now=101))
+        self.assertFalse(guard.is_echo("I can book a follow-up meeting for Thursday afternoon", now=113))
+
+    def test_short_utterances_require_an_exact_immediate_match(self):
+        guard = MeetingEchoGuard()
+        guard.remember_output("Yes, absolutely.", now=100)
+        self.assertTrue(guard.is_echo("Yes absolutely", now=101))
+        self.assertFalse(guard.is_echo("Yes, maybe", now=101))
+        self.assertFalse(guard.is_echo("Yes absolutely", now=104))
 
 
 class MeetingConversationDefaultsTests(unittest.TestCase):

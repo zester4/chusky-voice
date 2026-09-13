@@ -42,7 +42,7 @@ from audio_formats import (
 )
 from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
-from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingMode, default_meeting_greeting, is_recall_invocation, parse_meeting_media_authorization
+from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, default_meeting_greeting, is_recall_invocation, parse_meeting_media_authorization
 
 LOG = logging.getLogger("chusky.voice_bridge")
 logging.basicConfig(level=os.getenv("VOICE_BRIDGE_LOG_LEVEL", "INFO"))
@@ -960,6 +960,7 @@ class RecallVoiceSession:
         self.greeting = greeting or default_meeting_greeting(self.interaction_mode)
         self.audio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
         self.context = MeetingContextWindow()
+        self.echo_guard = MeetingEchoGuard()
         self.copilot_gate = CopilotTurnGate(settings.copilot_min_interval_seconds)
         self.stop = asyncio.Event()
         self.send_lock = asyncio.Lock()
@@ -1102,11 +1103,18 @@ class RecallVoiceSession:
             if turn_event in {"StartOfTurn", "TurnResumed"}:
                 # Ordinary participants talking should neither burn model/TTS
                 # budget nor cut off Chusky. Barge in only when the wake word
-                # is actually present in the current recognized turn.
-                if is_recall_invocation(transcript):
+                # is actually present in the current recognized turn. Ignore
+                # provisional transcripts matching recently streamed TTS so
+                # Chusky cannot interrupt itself through the meeting mix.
+                if self.echo_guard.is_echo(transcript):
+                    self.metrics.turns_suppressed += 1
+                elif is_recall_invocation(transcript):
                     await self._interrupt()
             elif turn_event == "EndOfTurn" and transcript:
                 self.metrics.stt_final_turns += 1
+                if self.echo_guard.is_echo(transcript):
+                    self.metrics.turns_suppressed += 1
+                    continue
                 invoked = is_recall_invocation(transcript)
                 context = self.context.snapshot()
                 self.context.add("participant", transcript)
@@ -1207,6 +1215,7 @@ class RecallVoiceSession:
 
     async def _speak(self, text: str) -> None:
         self.tts_done_event = asyncio.Event()
+        self.echo_guard.remember_output(text)
         await self._send_tts(text, flush=True)
         await asyncio.wait_for(self.tts_done_event.wait(), timeout=45.0)
 
@@ -1250,9 +1259,11 @@ class RecallVoiceSession:
                         full_text += delta
                         buffer += delta
                         if any(buffer.rstrip().endswith(mark) for mark in (".", "!", "?", ":", ";")):
+                            self.echo_guard.remember_output(buffer)
                             await self._send_tts(buffer)
                             buffer = ""
                         elif len(buffer) >= 120:
+                            self.echo_guard.remember_output(buffer)
                             await self._send_tts(buffer)
                             buffer = ""
                     elif event.get("type") == "silent":
@@ -1294,6 +1305,8 @@ class RecallVoiceSession:
                     )
                     response.raise_for_status()
             return
+        if buffer.strip():
+            self.echo_guard.remember_output(buffer)
         await self._send_tts(buffer, flush=True)
         await asyncio.wait_for(self.tts_done_event.wait(), timeout=45.0)
         async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:

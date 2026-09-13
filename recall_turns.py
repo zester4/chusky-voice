@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import time
 from collections import deque
+from difflib import SequenceMatcher
 from typing import Any, Literal
 
 
@@ -84,6 +85,56 @@ class MeetingContextWindow:
         timestamp = time.monotonic() if now is None else float(now)
         self._prune(timestamp)
         return [{"role": role, "text": text} for _, role, text in self._items]
+
+
+class MeetingEchoGuard:
+    """Drop short-lived STT echoes of Chusky's own recently streamed speech."""
+
+    def __init__(self, ttl_seconds: int = 12, max_chunks: int = 48) -> None:
+        self.ttl_seconds = max(2, min(int(ttl_seconds), 30))
+        self.max_chunks = max(1, min(int(max_chunks), 64))
+        self._chunks: deque[tuple[float, tuple[str, ...]]] = deque()
+
+    @staticmethod
+    def _tokens(text: str) -> tuple[str, ...]:
+        if not isinstance(text, str):
+            return ()
+        return tuple(re.findall(r"[\w']+", text.casefold()))[:250]
+
+    def _prune(self, now: float) -> None:
+        while self._chunks and now - self._chunks[0][0] > self.ttl_seconds:
+            self._chunks.popleft()
+        while len(self._chunks) > self.max_chunks:
+            self._chunks.popleft()
+
+    def remember_output(self, text: str, now: float | None = None) -> None:
+        tokens = self._tokens(text)
+        if not tokens:
+            return
+        timestamp = time.monotonic() if now is None else float(now)
+        self._prune(timestamp)
+        self._chunks.append((timestamp, tokens))
+        self._prune(timestamp)
+
+    def is_echo(self, transcript: str, now: float | None = None) -> bool:
+        tokens = self._tokens(transcript)
+        if not tokens:
+            return False
+        timestamp = time.monotonic() if now is None else float(now)
+        self._prune(timestamp)
+        if not self._chunks:
+            return False
+
+        if len(tokens) < 5:
+            # Short affirmations are too ambiguous to match approximately.
+            if any(timestamp - spoken_at <= 2 and tokens == spoken for spoken_at, spoken in self._chunks):
+                return True
+            if len(tokens) < 3:
+                return False
+
+        recent_speech = tuple(token for _, chunk in self._chunks for token in chunk)[-600:]
+        matched = sum(block.size for block in SequenceMatcher(None, tokens, recent_speech, autojunk=False).get_matching_blocks())
+        return matched / len(tokens) >= 0.9
 
 
 def is_recall_invocation(transcript: str, wake_word: str = "Chusky") -> bool:
