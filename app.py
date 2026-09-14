@@ -1,10 +1,9 @@
 """Chusky's server-side voice media bridge.
 
-This service accepts an already-authorized call handoff from Chusky, joins the
-short-lived Agora room supplied by Sendblue, streams 16 kHz PCM to Deepgram,
-and speaks Chusky's response back into the room. It intentionally stores no
-audio, Agora token, or caller phone number. Chusky may retain bounded text
-turns in the owner's existing private conversation history.
+This service accepts Twilio bidirectional Media Streams and Recall meeting
+audio, streams transient audio to Deepgram, and plays Chusky's responses back
+through the provider session. It stores no raw audio or caller credentials.
+Chusky may retain bounded text turns in the owner's private conversation.
 """
 from __future__ import annotations
 
@@ -26,7 +25,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from starlette.responses import HTMLResponse
 from websockets.asyncio.client import connect
 from audio_formats import (
@@ -49,12 +48,6 @@ from twilio_auth import valid_twilio_ticket
 LOG = logging.getLogger("chusky.voice_bridge")
 logging.basicConfig(level=os.getenv("VOICE_BRIDGE_LOG_LEVEL", "INFO"))
 load_dotenv(Path(__file__).with_name(".env"))
-SAMPLE_RATE = 16_000
-CHANNELS = 1
-BYTES_PER_MS = SAMPLE_RATE * CHANNELS * 2 // 1000
-PCM_CHUNK_BYTES = BYTES_PER_MS * 20
-
-
 @dataclass(frozen=True)
 class Settings:
     bridge_secret: str
@@ -75,12 +68,12 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        secret = os.getenv("FACETIME_MEDIA_BRIDGE_SECRET", "").strip()
+        secret = os.getenv("TWILIO_MEDIA_BRIDGE_SECRET", "").strip()
         deepgram = os.getenv("DEEPGRAM_API_KEY", "").strip()
-        turn_url = os.getenv("CHUSKY_VOICE_TURN_URL", "http://127.0.0.1:3003/internal/facetime/turn").strip()
-        status_url = os.getenv("CHUSKY_VOICE_STATUS_URL", "http://127.0.0.1:3003/internal/facetime/status").strip()
+        turn_url = os.getenv("CHUSKY_VOICE_TURN_URL", "http://127.0.0.1:3003/internal/twilio/turn").strip()
+        status_url = os.getenv("CHUSKY_VOICE_STATUS_URL", "http://127.0.0.1:3003/internal/twilio/status").strip()
         if not secret or not deepgram or not turn_url.startswith(("http://", "https://")) or not turn_url.endswith("/turn") or not status_url.startswith(("http://", "https://")):
-            raise RuntimeError("FACETIME_MEDIA_BRIDGE_SECRET, DEEPGRAM_API_KEY, CHUSKY_VOICE_TURN_URL ending in /turn, and CHUSKY_VOICE_STATUS_URL are required")
+            raise RuntimeError("TWILIO_MEDIA_BRIDGE_SECRET, DEEPGRAM_API_KEY, CHUSKY_VOICE_TURN_URL ending in /turn, and CHUSKY_VOICE_STATUS_URL are required")
         return cls(
             secret, deepgram, turn_url, status_url,
             max(60, min(int(os.getenv("VOICE_BRIDGE_MAX_CALL_SECONDS", "7200")), 14_400)),
@@ -167,6 +160,7 @@ class RecallConfigurationError(RuntimeError):
         self.code = code
         self.fields = fields
 
+
 class RecallMeetingAgentError(RuntimeError):
     """A meeting-turn failure carrying only a validated diagnostic code."""
 
@@ -175,294 +169,6 @@ class RecallMeetingAgentError(RuntimeError):
     def __init__(self, code: Any) -> None:
         self.failure_code = code if isinstance(code, str) and code in self.ALLOWED_CODES else "agent_run_failed"
         super().__init__("Chusky meeting agent stream failed")
-
-
-class AgoraCredentials(BaseModel):
-    appId: str = Field(min_length=1, max_length=300)
-    channelName: str = Field(min_length=1, max_length=300)
-    token: str = Field(min_length=1, max_length=4000)
-    uid: int = Field(ge=0)
-
-
-class StartCall(BaseModel):
-    callId: str = Field(pattern=r"^ftc_[0-9a-fA-F-]{36}$")
-    userId: int = Field(gt=0)
-    phoneNumber: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
-    purpose: str = Field(min_length=1, max_length=1000)
-    agora: AgoraCredentials
-
-
-class CallerAudioObserver:  # Base class is added dynamically after Agora imports.
-    pass
-
-
-def valid_twilio_websocket(websocket: WebSocket, settings: Settings) -> bool:
-    """Validate Twilio's signed WSS handshake using its official SDK helper.
-
-    Twilio documents a trailing-slash retry for WebSocket validation; we retain
-    the short-lived Chusky ticket as a second independent authorization check.
-    """
-    signature = websocket.headers.get("x-twilio-signature", "")
-    if not signature or not settings.twilio_auth_token or not settings.twilio_media_stream_url:
-        return False
-    try:
-        from twilio.request_validator import RequestValidator
-        validator = RequestValidator(settings.twilio_auth_token)
-        return validator.validate(settings.twilio_media_stream_url, {}, signature) or validator.validate(f"{settings.twilio_media_stream_url}/", {}, signature)
-    except Exception:
-        LOG.exception("Twilio WebSocket signature validation could not run")
-        return False
-
-
-def load_agora_observer(loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[bytes]):
-    """Load the optional native SDK only when a live call starts."""
-    from agora.rtc.audio_frame_observer import IAudioFrameObserver  # type: ignore[import-not-found]
-
-    class Observer(IAudioFrameObserver):
-        def _enqueue(self, audio: bytes) -> None:
-            def put() -> None:
-                if not queue.full():
-                    queue.put_nowait(audio)
-            loop.call_soon_threadsafe(put)
-
-        def on_record_audio_frame(self, *_args: Any) -> int:
-            return 0
-
-        def on_playback_audio_frame(self, *_args: Any) -> int:
-            return 0
-
-        def on_ear_monitoring_audio_frame(self, *_args: Any) -> int:
-            return 0
-
-        def on_playback_audio_frame_before_mixing(self, _local_user: Any, _channel_id: str, _uid: str, frame: Any, *_args: Any) -> int:
-            # Agora is configured below to provide exactly 16 kHz mono 16-bit PCM.
-            if frame.samples_per_sec == SAMPLE_RATE and frame.channels == CHANNELS and frame.bytes_per_sample == 2 and frame.buffer:
-                self._enqueue(bytes(frame.buffer))
-            return 1
-
-        def on_get_audio_frame_position(self, *_args: Any) -> int:
-            return 0
-
-    return Observer()
-
-
-class VoiceCall:
-    def __init__(self, request: StartCall, settings: Settings) -> None:
-        self.request = request
-        self.settings = settings
-        self.session_id = f"vbr_{uuid.uuid4()}"
-        self.stop = asyncio.Event()
-        self.audio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=500)  # bounded: roughly ten seconds.
-        self.connection: Any | None = None
-        self.service: Any | None = None
-        self.response_task: asyncio.Task[None] | None = None
-        self.tts_socket: Any | None = None
-        self.tts_lock = asyncio.Lock()
-        self.finalized_turn_indexes: set[int] = set()
-
-    async def run(self) -> None:
-        try:
-            self._connect_agora()
-            await self._notify_status("active")
-            await asyncio.wait_for(self._run_transcription(), timeout=self.settings.max_call_seconds)
-            await self._notify_status("ended")
-        except asyncio.TimeoutError:
-            LOG.info("Voice call reached maximum duration", extra={"call_id": self.request.callId})
-            await self._notify_status("ended")
-        except Exception:
-            LOG.exception("Voice call ended with an error", extra={"call_id": self.request.callId})
-            await self._notify_status("failed", "media bridge connection or processing failed")
-        finally:
-            self.stop.set()
-            if self.response_task and not self.response_task.done():
-                self.response_task.cancel()
-                await asyncio.gather(self.response_task, return_exceptions=True)
-            self._release_agora()
-
-    def _connect_agora(self) -> None:
-        # Exact configuration follows Agora's Python Server SDK PCM receive/send example.
-        from agora.rtc.agora_service import AgoraService, AgoraServiceConfig  # type: ignore[import-not-found]
-        from agora.rtc.agora_base import (  # type: ignore[import-not-found]
-            AudioProfileType, AudioPublishType, AudioScenarioType, AudioSubscriptionOptions,
-            RTCConnConfig, RtcConnectionPublishConfig, VideoPublishType,
-        )
-
-        loop = asyncio.get_running_loop()
-        service = AgoraService()
-        result = service.initialize(AgoraServiceConfig(
-            appid=self.request.agora.appId,
-            enable_audio_processor=1,
-            enable_audio_device=0,
-            enable_video=0,
-        ))
-        if result != 0:
-            raise RuntimeError(f"Agora service initialization failed ({result})")
-        connection = service.create_rtc_connection(
-            RTCConnConfig(
-                auto_subscribe_audio=1,
-                auto_subscribe_video=0,
-                audio_recv_media_packet=0,
-                audio_subs_options=AudioSubscriptionOptions(packet_only=0, pcm_data_only=1, bytes_per_sample=2, number_of_channels=1, sample_rate_hz=SAMPLE_RATE),
-            ),
-            RtcConnectionPublishConfig(
-                audio_profile=AudioProfileType.AUDIO_PROFILE_DEFAULT,
-                audio_scenario=AudioScenarioType.AUDIO_SCENARIO_AI_SERVER,
-                is_publish_audio=True,
-                is_publish_video=False,
-                audio_publish_type=AudioPublishType.AUDIO_PUBLISH_TYPE_PCM,
-                video_publish_type=VideoPublishType.VIDEO_PUBLISH_TYPE_NONE,
-            ),
-        )
-        if connection is None:
-            service.release()
-            raise RuntimeError("Agora connection could not be created")
-        if connection.connect(self.request.agora.token, self.request.agora.channelName, str(self.request.agora.uid)) != 0:
-            connection.release()
-            service.release()
-            raise RuntimeError("Agora channel connection failed")
-        local_user = connection.get_local_user()
-        # Must be configured before registering the frame observer.
-        local_user.set_playback_audio_frame_before_mixing_parameters(CHANNELS, SAMPLE_RATE)
-        if connection.register_audio_frame_observer(load_agora_observer(loop, self.audio), 0, None) != 0:
-            connection.disconnect()
-            connection.release()
-            service.release()
-            raise RuntimeError("Agora audio observer registration failed")
-        if connection.publish_audio() != 0:
-            connection.disconnect()
-            connection.release()
-            service.release()
-            raise RuntimeError("Agora audio publish failed")
-        self.connection, self.service = connection, service
-
-    async def _run_transcription(self) -> None:
-        if not self.settings.stt_model.startswith("flux-"):
-            raise RuntimeError("VOICE_STT_MODEL must be a Deepgram Flux conversational model, for example flux-general-en")
-        query = (
-            f"model={self.settings.stt_model}&encoding=linear16&sample_rate=16000"
-            f"&eager_eot_threshold={self.settings.stt_eager_eot_threshold}"
-            f"&eot_threshold={self.settings.stt_eot_threshold}"
-            f"&eot_timeout_ms={self.settings.stt_eot_timeout_ms}"
-        )
-        url = f"wss://api.deepgram.com/v2/listen?{query}"
-        async with connect(url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000) as socket:
-            sender = asyncio.create_task(self._send_audio(socket))
-            receiver = asyncio.create_task(self._receive_transcripts(socket))
-            stopper = asyncio.create_task(self.stop.wait())
-            done, pending = await asyncio.wait({sender, receiver, stopper}, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            for task in done:
-                task.result()
-
-    async def _send_audio(self, socket: Any) -> None:
-        while not self.stop.is_set():
-            audio = await self.audio.get()
-            await socket.send(audio)
-
-    async def _receive_transcripts(self, socket: Any) -> None:
-        async for raw in socket:
-            if not isinstance(raw, str):
-                continue
-            event = json.loads(raw)
-            if event.get("type") != "TurnInfo":
-                continue
-            turn_event = str(event.get("event") or "")
-            transcript = str(event.get("transcript") or "").strip()
-            try:
-                turn_index = int(event.get("turn_index") or 0)
-            except (TypeError, ValueError):
-                continue
-            if turn_event in {"StartOfTurn", "TurnResumed"}:
-                await self._barge_in()
-            elif turn_event == "EndOfTurn" and transcript and turn_index not in self.finalized_turn_indexes:
-                self.finalized_turn_indexes.add(turn_index)
-                if self.response_task and not self.response_task.done():
-                    self.response_task.cancel()
-                    await asyncio.gather(self.response_task, return_exceptions=True)
-                self.response_task = asyncio.create_task(self._respond(transcript), name=f"facetime-response-{self.request.callId}-{turn_index}")
-
-    async def _barge_in(self) -> None:
-        if not self.response_task or self.response_task.done():
-            return
-        if self.tts_socket is not None:
-            try:
-                async with self.tts_lock:
-                    await self.tts_socket.send(json.dumps({"type": "Interrupt"}))
-            except Exception:
-                pass
-        self.response_task.cancel()
-        await asyncio.gather(self.response_task, return_exceptions=True)
-        self.response_task = None
-
-    async def _respond(self, transcript: str) -> None:
-        # The bridge has no agent, memory, or tool credentials. Chusky owns all of that.
-        async with httpx.AsyncClient(timeout=httpx.Timeout(45.0, connect=10.0)) as client:
-            response = await client.post(self.settings.chusky_turn_url, headers={"Authorization": f"Bearer {self.settings.bridge_secret}"}, json={"callId": self.request.callId, "userId": self.request.userId, "transcript": transcript})
-            response.raise_for_status()
-            text = str(response.json().get("text") or "").strip()
-        if text:
-            await self._speak(text[:5000])
-
-    async def _notify_status(self, status: str, error: str | None = None) -> None:
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=5.0)) as client:
-                response = await client.post(self.settings.chusky_status_url, headers={"Authorization": f"Bearer {self.settings.bridge_secret}"}, json={"callId": self.request.callId, "userId": self.request.userId, "status": status, **({"error": error} if error else {})})
-                response.raise_for_status()
-        except Exception:
-            # The bridge must still clean up its Agora resources if Chusky is restarting.
-            LOG.warning("Could not report call status", extra={"call_id": self.request.callId, "status": status})
-
-    async def _speak(self, text: str) -> None:
-        if not self.settings.tts_model.startswith("flux-"):
-            raise RuntimeError("VOICE_TTS_MODEL must be a Flux streaming model (for example flux-haley-en)")
-        url = f"wss://api.deepgram.com/v2/speak?model={self.settings.tts_model}&encoding=linear16&sample_rate=16000"
-        async with connect(url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000) as socket:
-            self.tts_socket = socket
-            try:
-                async with self.tts_lock:
-                    await socket.send(json.dumps({"type": "Speak", "text": text}))
-                    await socket.send(json.dumps({"type": "Flush"}))
-                async for raw in socket:
-                    if isinstance(raw, bytes):
-                        if self.stop.is_set() or self.connection is None:
-                            return
-                        # Flux returns raw PCM frames. Push them as soon as
-                        # they arrive instead of waiting for a complete file.
-                        remainder = len(raw) % BYTES_PER_MS
-                        if remainder:
-                            raw += b"\x00" * (BYTES_PER_MS - remainder)
-                        for offset in range(0, len(raw), PCM_CHUNK_BYTES):
-                            if self.stop.is_set() or self.connection is None:
-                                return
-                            while not self.stop.is_set() and not self.connection.is_push_to_rtc_completed():
-                                await asyncio.sleep(0.01)
-                            if self.stop.is_set():
-                                return
-                            chunk = memoryview(raw[offset:offset + PCM_CHUNK_BYTES])
-                            if self.connection.push_audio_pcm_data(chunk, SAMPLE_RATE, CHANNELS) != 0:
-                                raise RuntimeError("Agora rejected synthesized PCM audio")
-                            await asyncio.sleep(len(chunk) / (SAMPLE_RATE * CHANNELS * 2))
-                    elif isinstance(raw, str) and json.loads(raw).get("type") == "SpeechMetadata":
-                        return
-            finally:
-                self.tts_socket = None
-
-    def _release_agora(self) -> None:
-        if self.connection is not None:
-            try:
-                self.connection.disconnect()
-                self.connection.release()
-            except Exception:
-                LOG.exception("Agora connection cleanup failed", extra={"call_id": self.request.callId})
-            self.connection = None
-        if self.service is not None:
-            try:
-                self.service.release()
-            except Exception:
-                LOG.exception("Agora service cleanup failed", extra={"call_id": self.request.callId})
-            self.service = None
 
 
 @dataclass(frozen=True)
@@ -1504,7 +1210,7 @@ class BridgeMetrics:
     agent_first_delta_samples: deque[int] = field(default_factory=lambda: deque(maxlen=256))
     end_of_turn_to_first_audio_samples: deque[int] = field(default_factory=lambda: deque(maxlen=256))
 
-    def snapshot(self, active_twilio: int, active_facetime: int) -> dict[str, Any]:
+    def snapshot(self, active_twilio: int) -> dict[str, Any]:
         return {
             "twilio": {
                 "active": active_twilio,
@@ -1522,32 +1228,17 @@ class BridgeMetrics:
                     "endOfTurnToFirstAudio": latency_summary(list(self.end_of_turn_to_first_audio_samples)),
                 },
             },
-            "facetime": {"active": active_facetime},
         }
 
 
 class CallManager:
     def __init__(self) -> None:
-        self.calls: dict[str, VoiceCall] = {}
         self.twilio_calls: set[str] = set()
         self.lock = asyncio.Lock()
 
-    async def start(self, request: StartCall, settings: Settings) -> VoiceCall:
-        async with self.lock:
-            existing = self.calls.get(request.callId)
-            if existing:
-                return existing
-            if len(self.calls) + len(self.twilio_calls) >= settings.max_active_calls:
-                raise RuntimeError("voice bridge call capacity reached")
-            call = VoiceCall(request, settings)
-            self.calls[request.callId] = call
-            task = asyncio.create_task(call.run(), name=f"facetime-{request.callId}")
-            task.add_done_callback(lambda _task: self.calls.pop(request.callId, None))
-            return call
-
     async def reserve_twilio(self, call_id: str, settings: Settings) -> bool:
         async with self.lock:
-            if call_id in self.twilio_calls or len(self.calls) + len(self.twilio_calls) >= settings.max_active_calls:
+            if call_id in self.twilio_calls or len(self.twilio_calls) >= settings.max_active_calls:
                 return False
             self.twilio_calls.add(call_id)
             return True
@@ -1576,9 +1267,9 @@ async def health() -> dict[str, Any]:
     try:
         settings = Settings.from_env()
         twilio_ready = bool(settings.twilio_auth_token and settings.twilio_media_stream_url.startswith("wss://"))
-        return {"ok": True, "checks": {"twilioWebSocket": "configured" if twilio_ready else "misconfigured", "fluxStt": "configured" if settings.stt_model.startswith("flux-") else "misconfigured", "fluxTts": "configured" if settings.tts_model.startswith("flux-") else "misconfigured"}, "metrics": metrics.snapshot(len(calls.twilio_calls), len(calls.calls))}
+        return {"ok": True, "checks": {"twilioWebSocket": "configured" if twilio_ready else "misconfigured", "fluxStt": "configured" if settings.stt_model.startswith("flux-") else "misconfigured", "fluxTts": "configured" if settings.tts_model.startswith("flux-") else "misconfigured"}, "metrics": metrics.snapshot(len(calls.twilio_calls))}
     except RuntimeError:
-        return {"ok": False, "checks": {"configuration": "misconfigured"}, "metrics": metrics.snapshot(len(calls.twilio_calls), len(calls.calls))}
+        return {"ok": False, "checks": {"configuration": "misconfigured"}, "metrics": metrics.snapshot(len(calls.twilio_calls))}
 
 
 @app.get("/recall/health")
@@ -1765,12 +1456,6 @@ async def recall_audio(websocket: WebSocket) -> None:
             recall_handshakes.release()
         if reserved_id:
             await recall_meetings.release(reserved_id)
-
-
-@app.post("/calls", status_code=202)
-async def start_call(request: StartCall, authorization: str | None = Header(default=None)) -> dict[str, str]:
-    """Retired legacy FaceTime entry point; all calls now originate in Twilio."""
-    raise HTTPException(status_code=410, detail="FaceTime calling is retired; use Twilio voice")
 
 
 @app.websocket("/twilio/stream")

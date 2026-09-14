@@ -1,10 +1,9 @@
 # Chusky voice bridge
 
-This private service bridges Chusky to live voice calls. Twilio Media Streams
-provide the telephone calling path; an optional legacy Sendblue FaceTime path
-uses Agora. Chusky remains the agent brain: the bridge sends speech turns to
-Chusky's authenticated internal endpoint and streams its responses back to the
-caller using Deepgram.
+This private service bridges Chusky to Twilio telephone calls and Recall
+meetings. Chusky remains the agent brain: the bridge sends speech turns to
+Chusky's authenticated internal endpoints and streams responses back using
+Deepgram.
 
 The bridge runs separately from Chusky and does not replace its model, memory,
 history, or tools. For telephone calls, Chusky retains committed text turns in
@@ -37,10 +36,10 @@ the only agent brain and supplies its existing history, memory, and tools.
 ## Required environment
 
 ```ini
-FACETIME_MEDIA_BRIDGE_SECRET=<same random secret configured in Chusky>
+TWILIO_MEDIA_BRIDGE_SECRET=<same random secret configured in Chusky>
 DEEPGRAM_API_KEY=<Deepgram server API key>
-CHUSKY_VOICE_TURN_URL=http://127.0.0.1:3003/internal/facetime/turn
-CHUSKY_VOICE_STATUS_URL=http://127.0.0.1:3003/internal/facetime/status
+CHUSKY_VOICE_TURN_URL=http://127.0.0.1:3003/internal/twilio/turn
+CHUSKY_VOICE_STATUS_URL=http://127.0.0.1:3003/internal/twilio/status
 VOICE_BRIDGE_HOST=127.0.0.1
 VOICE_BRIDGE_PORT=3004
 VOICE_BRIDGE_MAX_ACTIVE_CALLS=4
@@ -62,10 +61,10 @@ https://chusky-voice-production.up.railway.app
 Add these variables to the bridge service:
 
 ```ini
-FACETIME_MEDIA_BRIDGE_SECRET=<same random secret configured in Chusky>
+TWILIO_MEDIA_BRIDGE_SECRET=<same random secret configured in Chusky>
 DEEPGRAM_API_KEY=<Deepgram server API key>
-CHUSKY_VOICE_TURN_URL=https://chusky.up.railway.app/internal/facetime/turn
-CHUSKY_VOICE_STATUS_URL=https://chusky.up.railway.app/internal/facetime/status
+CHUSKY_VOICE_TURN_URL=https://chusky.up.railway.app/internal/twilio/turn
+CHUSKY_VOICE_STATUS_URL=https://chusky.up.railway.app/internal/twilio/status
 VOICE_BRIDGE_HOST=0.0.0.0
 ```
 
@@ -73,7 +72,7 @@ Do not set a fixed `VOICE_BRIDGE_PORT` on Railway. The bridge uses Railway's
 injected `PORT`; `VOICE_BRIDGE_PORT=3004` remains the local/Oracle fallback.
 
 Generate the shared bridge secret in PowerShell. Run this once, then paste the
-same output into both Railway services as `FACETIME_MEDIA_BRIDGE_SECRET`:
+same output into both Railway services as `TWILIO_MEDIA_BRIDGE_SECRET`:
 
 ```powershell
 $bytes = [byte[]]::new(32)
@@ -83,16 +82,8 @@ $rng.Dispose()
 [Convert]::ToBase64String($bytes)
 ```
 
-On the Chusky Railway service, configure:
-
-```ini
-SENDBLUE_FACETIME_ENABLED=true
-SENDBLUE_FACETIME_NUMBER=<Sendblue FaceTime-enabled number>
-FACETIME_MEDIA_BRIDGE_URL=https://chusky-voice-production.up.railway.app
-FACETIME_MEDIA_BRIDGE_SECRET=<the same generated secret>
-```
-
-For Twilio Media Streams, also set the bridge's `TWILIO_AUTH_TOKEN` and:
+For Twilio Media Streams, configure the same `TWILIO_MEDIA_BRIDGE_SECRET` on
+Chusky, and set the bridge's `TWILIO_AUTH_TOKEN` plus:
 
 ```ini
 TWILIO_MEDIA_STREAM_URL=wss://chusky-voice-production.up.railway.app/twilio/stream
@@ -102,8 +93,7 @@ The Chusky service's `TWILIO_MEDIA_STREAM_URL` must use the same WSS URL. The
 bridge's public domain must support WebSocket upgrades. Do not expose the
 private bridge secret or place it in `.env.example`.
 
-The Sendblue FaceTime bridge URL is not the Sendblue receive webhook. Normal
-Sendblue messages still use:
+Normal Sendblue messages still use the messaging webhook:
 
 ```text
 https://chusky.up.railway.app/sendblue/webhook
@@ -114,7 +104,7 @@ https://chusky.up.railway.app/sendblue/webhook
 ```bash
 cd ~/chusky/chusky-voice
 cp .env.example .env
-# Edit .env: set the same FACETIME_MEDIA_BRIDGE_SECRET as Chusky and a Deepgram key.
+# Edit .env: set the same TWILIO_MEDIA_BRIDGE_SECRET as Chusky and a Deepgram key.
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
@@ -188,8 +178,8 @@ The bridge converts Twilio's 8 kHz μ-law frames to the STT format, and converts
 TTS frames back to Twilio's required 8 kHz μ-law. Resampling state is preserved
 across frames. Upsampling the telephone audio does not restore detail that was
 not present in Twilio's 8 kHz source; this format choice is not itself a promise
-of lower end-to-end latency. The optional Agora/FaceTime path retains its
-separate audio settings and is unaffected by the Twilio conversion.
+of lower end-to-end latency. Recall meeting audio uses a separate
+configuration and transcription path.
 
 On `EagerEndOfTurn` the bridge starts a private, read-only draft; `TurnResumed`
 cancels it, and only the definitive `EndOfTurn` is committed to Chusky memory
@@ -403,9 +393,8 @@ at `/health`; never enable transcript or raw-audio logging for this purpose.
 
 ## Safety boundary
 
-`POST /calls` requires `Authorization: Bearer <FACETIME_MEDIA_BRIDGE_SECRET>`.
-The bridge can call only `/internal/facetime/turn`,
-`/internal/facetime/commit-turn`, and `/internal/facetime/status` with the
-same secret. Chusky validates the call ID and owner, uses the owner's existing
+The bridge calls only `/internal/twilio/turn`, `/internal/twilio/turn-stream`,
+`/internal/twilio/commit-turn`, and `/internal/twilio/status` using
+`Authorization: Bearer <TWILIO_MEDIA_BRIDGE_SECRET>`. Chusky validates the call ID and owner, uses the owner's existing
 memory, limits tools to read-only calls, and stores only committed text turns
 in normal history.

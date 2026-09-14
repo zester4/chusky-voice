@@ -1,4 +1,4 @@
-/** PM2 definition for the isolated FaceTime media bridge. */
+/** PM2 definition for the isolated Twilio/Recall voice media bridge. */
 module.exports = {
   apps: [{
     name: "chusky-voice",

@@ -61,13 +61,25 @@ class FakeTtsSocket:
 
 
 class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
+    def test_bridge_settings_use_twilio_only_internal_routes(self):
+        with patch.dict(voice_app.os.environ, {
+            "TWILIO_MEDIA_BRIDGE_SECRET": "twilio-bridge-test-secret",
+            "DEEPGRAM_API_KEY": "deepgram-test-key",
+            "CHUSKY_VOICE_TURN_URL": "https://chusky.example/internal/twilio/turn",
+            "CHUSKY_VOICE_STATUS_URL": "https://chusky.example/internal/twilio/status",
+        }, clear=True):
+            settings = voice_app.Settings.from_env()
+        self.assertEqual(settings.bridge_secret, "twilio-bridge-test-secret")
+        self.assertEqual(settings.chusky_turn_url, "https://chusky.example/internal/twilio/turn")
+        self.assertEqual(settings.chusky_status_url, "https://chusky.example/internal/twilio/status")
+
     async def asyncSetUp(self):
         self.websocket = FakeTwilioWebSocket()
         settings = SimpleNamespace(
             bridge_secret="test-bridge-secret",
             deepgram_api_key="test-deepgram-key",
-            chusky_turn_url="http://localhost/internal/facetime/turn",
-            chusky_status_url="http://localhost/internal/facetime/status",
+            chusky_turn_url="http://localhost/internal/twilio/turn",
+            chusky_status_url="http://localhost/internal/twilio/status",
             stt_model="flux-general-en",
             stt_eager_eot_threshold=0.45,
             stt_eot_threshold=0.65,
