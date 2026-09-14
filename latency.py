@@ -30,21 +30,24 @@ async def resolve_speculative_draft(
     task: asyncio.Task[T] | None,
     *,
     transcript_matches: bool,
-    grace_ms: int = 100,
+    grace_ms: int | None = 100,
 ) -> T | None:
-    """Reuse a matching draft only if it is ready almost immediately.
+    """Reuse a matching draft, optionally waiting for its streamed result.
 
-    An unfinished eager draft is canceled after a short grace period so the
-    definitive turn can use the streaming response path instead of waiting for
-    a complete, non-streaming model result.
+    ``None`` waits for completion; use this when the draft has already been
+    streamed to the caller and restarting inference would only add latency.
+    A numeric grace period preserves the older behavior for non-streaming
+    speculative drafts.
     """
     if task is None or not transcript_matches:
         return None
 
-    if not task.done() and grace_ms > 0:
+    if not task.done() and grace_ms is None:
+        await asyncio.gather(task, return_exceptions=True)
+    elif not task.done() and grace_ms > 0:
         await asyncio.wait({task}, timeout=grace_ms / 1000)
 
-    if not task.done():
+    if not task.done() and grace_ms is not None:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         return None
@@ -62,7 +65,7 @@ async def resolve_speculative_draft(
 def take_tts_chunk(
     buffer: str,
     *,
-    soft_limit: int = 48,
+    soft_limit: int = 24,
     hard_limit: int = 80,
 ) -> tuple[str, str] | None:
     """Split buffered model text on a word boundary without losing content."""

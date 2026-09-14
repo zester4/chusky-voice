@@ -181,24 +181,42 @@ not present in Twilio's 8 kHz source; this format choice is not itself a promise
 of lower end-to-end latency. Recall meeting audio uses a separate
 configuration and transcription path.
 
-On `EagerEndOfTurn` the bridge starts a private, read-only draft; `TurnResumed`
-cancels it, and only the definitive `EndOfTurn` is committed to Chusky memory
-and usage. This overlaps model time with end-of-turn detection without creating
-duplicate history. When caller speech resumes while Chusky is speaking, the
-bridge cancels the active response, sends Deepgram `Interrupt`, then Twilio
-`clear`: this is barge-in. `mark` events are emitted after complete responses
-for playback tracking. `/health` exposes only aggregate latency/error/barging
-counters.
+On `EagerEndOfTurn`, the bridge starts the actual streaming Chusky response and
+feeds its first complete phrase to Flux TTS immediately. If the caller resumes,
+`TurnResumed` cancels that speculative stream, interrupts Deepgram, and clears
+Twilio's playback queue. When the final `EndOfTurn` transcript matches, the
+bridge reuses the same response and commits it once; it does not cancel the
+draft and pay for a second model generation. If no eager event arrived or the
+final transcript differs, it starts a fresh final-turn stream. Only the exact
+final transcript and completed response are committed to Chusky history and
+usage. `mark` events are emitted after complete responses for playback
+tracking.
+
+Telephone turns continue to use `VOICE_MODEL`, the caller's existing account
+history, and relevant private memory. Their restricted native read-only tool
+allowlist is enforced before inference; they skip Composio session discovery,
+model-metadata lookup, agent-run trace writes, connected-account listing, and
+unrelated skill/playbook loading. OpenRouter is asked to prefer providers whose
+recent p90 latency is at most three seconds for these voice turns, while keeping
+provider/model fallback enabled. That is a routing preference, not a hard
+latency guarantee; model/provider time-to-first-token and TTS/network conditions
+still affect the final result.
+
+`/health` exposes only aggregate latency/error/barging counters, including
+`eagerToFirstAudio` and final-turn-to-first-audio timings. Use these to confirm
+that the speculative path is reducing silence in real authorized test calls.
 
 The Twilio health response also reports bounded rolling p50/p95 timings under
 `metrics.twilio.latencyMs`: `fluxEagerToFinal` measures the Flux confirmation
-window, `agentFirstDelta` measures bridge-to-first streamed Chusky text, and
-`endOfTurnToFirstAudio` measures caller-finished-to-first-audio. These contain
-timing samples only, not transcripts or phone numbers. Use them before changing
-Flux thresholds or the voice model so tuning targets the actual slow stage.
-They measure separate parts of the live path; use real calls to evaluate
-end-to-end responsiveness because local audio-conversion tests do not measure
-Twilio, Deepgram, network, or model latency.
+window, `agentFirstDelta` measures bridge-to-first streamed Chusky text,
+`eagerToFirstAudio` measures eager-draft-to-first-audio, and
+`endOfTurnToFirstAudio` measures caller-finished-to-first-audio (zero when the
+agent is already speaking by finalization). These contain timing samples only,
+not transcripts or phone numbers. Use them before changing Flux thresholds or
+the voice model so tuning targets the actual slow stage. They measure separate
+parts of the live path; use real calls to evaluate end-to-end responsiveness
+because local audio-conversion tests do not measure Twilio, Deepgram, network,
+or model latency.
 
 In the Twilio Console, set the purchased Twilio number's **A call comes in**
 webhook to `https://chusky.selithub.shop/twilio/inbound`, method `POST`. The

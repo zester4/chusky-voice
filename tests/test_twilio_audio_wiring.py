@@ -60,6 +60,94 @@ class FakeTtsSocket:
         self.closed = True
 
 
+class StreamingFakeTtsSocket:
+    def __init__(self):
+        self.sent = []
+        self.items = asyncio.Queue()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        item = await self.items.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+    async def send(self, message):
+        event = json.loads(message)
+        self.sent.append(event)
+        if event.get("type") == "Speak":
+            await self.items.put(b"\x00\x00" * 480)
+        elif event.get("type") == "Flush":
+            await self.items.put(json.dumps({"type": "SpeechMetadata"}))
+
+    async def close(self):
+        await self.items.put(None)
+
+
+class FakeAgentStreamResponse:
+    def __init__(self):
+        self.lines = [
+            json.dumps({"type": "delta", "text": "I can help you with that."}),
+            json.dumps({"type": "done", "text": "I can help you with that.", "cost": 0.01}),
+        ]
+
+    def raise_for_status(self):
+        return None
+
+    async def aiter_lines(self):
+        for line in self.lines:
+            await asyncio.sleep(0)
+            yield line
+
+
+class FakeAgentStreamContext:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self.response
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class FakeAgentHttp:
+    def __init__(self):
+        self.stream_requests = []
+        self.posts = []
+
+    def stream(self, method, url, **kwargs):
+        self.stream_requests.append({"method": method, "url": url, **kwargs})
+        return FakeAgentStreamContext(FakeAgentStreamResponse())
+
+    async def post(self, url, **kwargs):
+        self.posts.append({"url": url, **kwargs})
+
+        class Response:
+            def raise_for_status(self):
+                return None
+
+        return Response()
+
+    async def aclose(self):
+        return None
+
+
+class DeepgramTurnSocket:
+    def __init__(self, events):
+        self.events = events
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.events:
+            raise StopAsyncIteration
+        return json.dumps(self.events.pop(0))
+
+
 class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
     def test_bridge_settings_use_twilio_only_internal_routes(self):
         with patch.dict(voice_app.os.environ, {
@@ -171,6 +259,36 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
 
         query = parse_qs(urlparse(opened_urls[0]).query)
         self.assertEqual(query["model"], ["flux-hannah-en"])
+
+    async def test_inbound_eager_turn_streams_once_and_commits_the_final_answer(self):
+        agent_http = FakeAgentHttp()
+        self.call.http = agent_http
+        tts_socket = StreamingFakeTtsSocket()
+
+        async def fake_connect(_url, **_kwargs):
+            return tts_socket
+
+        transcript = "Can you help me with that?"
+        deepgram = DeepgramTurnSocket([
+            {"type": "TurnInfo", "event": "StartOfTurn", "turn_index": 1, "transcript": ""},
+            {"type": "TurnInfo", "event": "EagerEndOfTurn", "turn_index": 1, "transcript": transcript},
+            {"type": "TurnInfo", "event": "EndOfTurn", "turn_index": 1, "transcript": transcript},
+        ])
+        with patch.object(voice_app, "connect", fake_connect):
+            await self.call._receive_transcripts(deepgram)
+            await asyncio.wait_for(self.call.response_task, 1)
+
+        self.assertEqual(len(agent_http.stream_requests), 1)
+        request = agent_http.stream_requests[0]
+        self.assertTrue(request["json"]["speculative"])
+        self.assertEqual(request["json"]["transcript"], transcript)
+        self.assertEqual(len(agent_http.posts), 1)
+        self.assertTrue(agent_http.posts[0]["url"].endswith("/commit-turn"))
+        self.assertEqual(agent_http.posts[0]["json"]["text"], "I can help you with that.")
+        self.assertEqual([event["type"] for event in tts_socket.sent].count("Speak"), 1)
+        latency = self.call.metrics.snapshot(1)["twilio"]["latencyMs"]
+        self.assertEqual(latency["eagerToFirstAudio"]["count"], 1)
+        self.assertEqual(latency["endOfTurnToFirstAudio"]["count"], 1)
 
 
 if __name__ == "__main__":
