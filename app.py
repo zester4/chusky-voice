@@ -167,6 +167,15 @@ class RecallConfigurationError(RuntimeError):
         self.code = code
         self.fields = fields
 
+class RecallMeetingAgentError(RuntimeError):
+    """A meeting-turn failure carrying only a validated diagnostic code."""
+
+    ALLOWED_CODES = frozenset({"approval_required", "agent_run_failed"})
+
+    def __init__(self, code: Any) -> None:
+        self.failure_code = code if isinstance(code, str) and code in self.ALLOWED_CODES else "agent_run_failed"
+        super().__init__("Chusky meeting agent stream failed")
+
 
 class AgoraCredentials(BaseModel):
     appId: str = Field(min_length=1, max_length=300)
@@ -1230,10 +1239,13 @@ class RecallVoiceSession:
                 status_hint = f" HTTP {exc.response.status_code}"
             elif hasattr(exc, "status_code"):
                 status_hint = f" HTTP {exc.status_code}"
+            failure_code = getattr(exc, "failure_code", None)
+            if failure_code not in RecallMeetingAgentError.ALLOWED_CODES:
+                failure_code = None
             LOG.warning(
-                "Recall meeting response failed: %s%s",
-                exc_type, status_hint,
-                extra={"meeting_id": self.meeting_id, "stage": "agent_response", "error_type": exc_type},
+                "Recall meeting response failed: %s%s%s",
+                exc_type, status_hint, f" code={failure_code}" if failure_code else "",
+                extra={"meeting_id": self.meeting_id, "stage": "agent_response", "error_type": exc_type, **({"failure_code": failure_code} if failure_code else {})},
             )
 
     async def _interrupt(self) -> None:
@@ -1384,7 +1396,7 @@ class RecallVoiceSession:
                             full_text = fallback_text
                             buffer = fallback_text
                     elif event.get("type") == "error":
-                        raise RuntimeError("Chusky meeting agent stream failed")
+                        raise RecallMeetingAgentError(event.get("code"))
         full_text = normalize_voice_text(full_text)[:5000]
         if not received_done:
             return
