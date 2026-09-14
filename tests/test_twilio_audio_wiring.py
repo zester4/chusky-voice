@@ -43,7 +43,7 @@ class DeepgramConnectionContext:
 class FakeTtsSocket:
     def __init__(self):
         self.items = [
-            b"\x00\x00" * 480,  # 20 ms, mono linear16 at 24 kHz.
+            b"\xff" * 160,  # 20 ms, raw μ-law at 8 kHz.
             json.dumps({"type": "SpeechMetadata"}),
         ]
         self.closed = False
@@ -78,7 +78,7 @@ class StreamingFakeTtsSocket:
         event = json.loads(message)
         self.sent.append(event)
         if event.get("type") == "Speak":
-            await self.items.put(b"\x00\x00" * 480)
+            await self.items.put(b"\xff" * 160)
         elif event.get("type") == "Flush":
             await self.items.put(json.dumps({"type": "SpeechMetadata"}))
 
@@ -173,6 +173,7 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
             stt_eot_threshold=0.65,
             stt_eot_timeout_ms=800,
             tts_model="flux-haley-en",
+            twilio_native_mulaw=True,
             greeting="",
         )
         self.call = voice_app.TwilioVoiceCall(
@@ -186,7 +187,7 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.call.http.aclose)
         self.addAsyncCleanup(self.call._close_persistent_tts)
 
-    async def test_twilio_ingress_is_resampled_before_being_sent_to_flux(self):
+    async def test_twilio_ingress_is_sent_to_flux_without_transcoding(self):
         sent_audio = []
         sent_once = asyncio.Event()
 
@@ -201,10 +202,9 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
         sender.cancel()
         await asyncio.gather(sender, return_exceptions=True)
 
-        # A 20 ms Twilio μ-law frame becomes approximately 20 ms of 48 kHz PCM.
-        self.assertLess(abs(len(sent_audio[0]) / 2 / 48000 - 0.020), 0.00011)
+        self.assertEqual(sent_audio, [b"\xff" * 160])
 
-    async def test_flux_stt_connection_declares_48khz_linear16(self):
+    async def test_flux_stt_connection_declares_native_mulaw(self):
         opened_urls = []
 
         def fake_connect(url, **_kwargs):
@@ -215,10 +215,10 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
             await self.call._run()
 
         query = parse_qs(urlparse(opened_urls[0]).query)
-        self.assertEqual(query["encoding"], ["linear16"])
-        self.assertEqual(query["sample_rate"], ["48000"])
+        self.assertEqual(query["encoding"], ["mulaw"])
+        self.assertEqual(query["sample_rate"], ["8000"])
 
-    async def test_flux_tts_24khz_pcm_is_encoded_as_twilio_8khz_mulaw(self):
+    async def test_flux_tts_native_mulaw_is_forwarded_to_twilio_unchanged(self):
         deepgram_socket = FakeTtsSocket()
         opened_urls = []
 
@@ -234,11 +234,11 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
             await self.call.tts_reader_task
 
         query = parse_qs(urlparse(opened_urls[0]).query)
-        self.assertEqual(query["encoding"], ["linear16"])
-        self.assertEqual(query["sample_rate"], ["24000"])
+        self.assertEqual(query["encoding"], ["mulaw"])
+        self.assertEqual(query["sample_rate"], ["8000"])
         media = next(item for item in self.websocket.sent if item.get("event") == "media")
         encoded_payload = media["media"]["payload"]
-        self.assertEqual(len(base64.b64decode(encoded_payload)), 160)
+        self.assertEqual(base64.b64decode(encoded_payload), b"\xff" * 160)
 
     async def test_selected_voice_overrides_bridge_default_for_tts_connection(self):
         opened_urls = []

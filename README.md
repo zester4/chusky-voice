@@ -169,17 +169,16 @@ VOICE_BARGE_IN_MIN_CHARS=2
 VOICE_GREETING=Hi, this is Chusky. How can I help?
 ```
 
-The bridge uses Deepgram Flux conversational STT (`/v2/listen`) at 48 kHz
-linear16 and streaming Flux TTS (`/v2/speak`) at 24 kHz linear16 for Twilio.
+The bridge uses Deepgram Flux conversational STT (`/v2/listen`) and streaming
+Flux TTS (`/v2/speak`) in Twilio's native raw 8 kHz μ-law format by default.
 The authenticated Chusky service may provide the owner's selected Flux voice
 for an individual Twilio call; that choice is bound into the short-lived HMAC
 stream ticket and overrides this environment default for that call only.
-The bridge converts Twilio's 8 kHz μ-law frames to the STT format, and converts
-TTS frames back to Twilio's required 8 kHz μ-law. Resampling state is preserved
-across frames. Upsampling the telephone audio does not restore detail that was
-not present in Twilio's 8 kHz source; this format choice is not itself a promise
-of lower end-to-end latency. Recall meeting audio uses a separate
-configuration and transcription path.
+This removes the per-frame decode/resample/encode route from the telephone
+path. Set `VOICE_TWILIO_NATIVE_MULAW=false` only for a measured temporary
+rollback to the legacy 48 kHz linear16 STT / 24 kHz linear16 TTS route; it is
+not a normal deployment setting. Recall meeting audio remains an independent
+48 kHz linear PCM input / 24 kHz linear PCM output path.
 
 On `EagerEndOfTurn`, the bridge starts the actual streaming Chusky response and
 feeds its first complete phrase to Flux TTS immediately. If the caller resumes,
@@ -192,15 +191,16 @@ final transcript and completed response are committed to Chusky history and
 usage. `mark` events are emitted after complete responses for playback
 tracking.
 
-Telephone turns continue to use `VOICE_MODEL`, the caller's existing account
+Telephone turns use the dedicated `VOICE_MODEL`, the caller's durable account
 history, and relevant private memory. Their restricted native read-only tool
 allowlist is enforced before inference; they skip Composio session discovery,
 model-metadata lookup, agent-run trace writes, connected-account listing, and
-unrelated skill/playbook loading. OpenRouter is asked to prefer providers whose
-recent p90 latency is at most three seconds for these voice turns, while keeping
-provider/model fallback enabled. That is a routing preference, not a hard
-latency guarantee; model/provider time-to-first-token and TTS/network conditions
-still affect the final result.
+unrelated skill/playbook loading. The live prompt keeps only a bounded recent
+history window while summaries and memory preserve longer-running context.
+OpenRouter receives a two-second latency preference, a throughput preference,
+a per-call affinity key, and optional voice-model candidates. These are routing
+preferences rather than a hard latency guarantee; model/provider time-to-first-token
+and network conditions still affect the final result.
 
 `/health` exposes only aggregate latency/error/barging counters, including
 `eagerToFirstAudio` and final-turn-to-first-audio timings. Use these to confirm

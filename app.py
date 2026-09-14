@@ -63,6 +63,7 @@ class Settings:
     stt_eot_threshold: float
     stt_eot_timeout_ms: int
     tts_model: str
+    twilio_native_mulaw: bool
     barge_in_min_chars: int
     greeting: str
 
@@ -87,6 +88,7 @@ class Settings:
             # silence window. Keep the default responsive for live calls.
             max(500, min(int(os.getenv("VOICE_STT_EOT_TIMEOUT_MS", "800")), 60_000)),
             os.getenv("VOICE_TTS_MODEL", "flux-haley-en").strip(),
+            os.getenv("VOICE_TWILIO_NATIVE_MULAW", "true").strip().lower() != "false",
             max(1, min(int(os.getenv("VOICE_BARGE_IN_MIN_CHARS", "2")), 100)),
             os.getenv("VOICE_GREETING", "Hi, this is Chusky. How can I help?").strip()[:500],
         )
@@ -180,9 +182,10 @@ class VoiceTurnResult:
 class TwilioVoiceCall:
     """Twilio bidirectional Media Stream transport.
 
-    Twilio sends and accepts base64 `audio/x-mulaw` at 8 kHz. The bridge
-    converts at the provider boundary to Deepgram's configured 48 kHz input
-    and 24 kHz output formats; Chusky remains the sole agent/LLM runtime.
+    Twilio sends and accepts base64 `audio/x-mulaw` at 8 kHz. Flux receives
+    and emits that native format by default, eliminating per-frame codec and
+    resample work. The legacy PCM route remains an explicit configuration
+    rollback; Chusky remains the sole agent/LLM runtime.
     """
     def __init__(self, call_id: str, user_id: int, stream_sid: str, websocket: WebSocket, settings: Settings, metrics: "BridgeMetrics", tts_model: str | None = None) -> None:
         self.call_id, self.user_id, self.stream_sid = call_id, user_id, stream_sid
@@ -256,6 +259,7 @@ class TwilioVoiceCall:
             self.settings.stt_eager_eot_threshold,
             self.settings.stt_eot_threshold,
             self.settings.stt_eot_timeout_ms,
+            native_mulaw=getattr(self.settings, "twilio_native_mulaw", True),
         )
         async with connect(url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000) as socket:
             inbound = asyncio.create_task(self._receive_twilio(), name=f"twilio-in-{self.call_id}")
@@ -297,10 +301,10 @@ class TwilioVoiceCall:
     async def _send_audio(self, socket: Any) -> None:
         while not self.stop.is_set():
             twilio_frame = await self.audio.get()
-            linear16, self.stt_resample_state = twilio_mulaw_to_deepgram_linear16(
-                twilio_frame,
-                self.stt_resample_state,
-            )
+            if getattr(self.settings, "twilio_native_mulaw", True):
+                await socket.send(twilio_frame)
+                continue
+            linear16, self.stt_resample_state = twilio_mulaw_to_deepgram_linear16(twilio_frame, self.stt_resample_state)
             if linear16:
                 await socket.send(linear16)
 
@@ -453,7 +457,7 @@ class TwilioVoiceCall:
             return
         if not re.fullmatch(r"flux-[a-z]+-en", self.tts_model):
             raise RuntimeError("VOICE_TTS_MODEL must be a Flux streaming model (for example flux-haley-en)")
-        url = twilio_deepgram_speak_url(self.tts_model)
+        url = twilio_deepgram_speak_url(self.tts_model, native_mulaw=getattr(self.settings, "twilio_native_mulaw", True))
         self.tts_socket = await connect(url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000)
         self.tts_resample_state = None
         self.tts_reader_task = asyncio.create_task(self._receive_persistent_tts(), name=f"twilio-tts-{self.call_id}")
@@ -483,10 +487,10 @@ class TwilioVoiceCall:
                         else:
                             self.metrics.end_of_turn_to_first_audio_samples.append(first_audio_ms)
                         self.tts_first_audio_recorded = True
-                    twilio_audio, self.tts_resample_state = deepgram_linear16_to_twilio_mulaw(
-                        raw,
-                        self.tts_resample_state,
-                    )
+                    if getattr(self.settings, "twilio_native_mulaw", True):
+                        twilio_audio = raw
+                    else:
+                        twilio_audio, self.tts_resample_state = deepgram_linear16_to_twilio_mulaw(raw, self.tts_resample_state)
                     for offset in range(0, len(twilio_audio), 1600):
                         payload = base64.b64encode(twilio_audio[offset:offset + 1600]).decode()
                         await self._send_twilio({"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}})
@@ -653,7 +657,7 @@ class TwilioVoiceCall:
     async def _speak(self, text: str) -> None:
         if not re.fullmatch(r"flux-[a-z]+-en", self.tts_model):
             raise RuntimeError("VOICE_TTS_MODEL must be a Flux streaming model (for example flux-haley-en)")
-        url = twilio_deepgram_speak_url(self.tts_model)
+        url = twilio_deepgram_speak_url(self.tts_model, native_mulaw=getattr(self.settings, "twilio_native_mulaw", True))
         first_audio_at: float | None = None
         resample_state: object | None = None
         async with connect(url, additional_headers={"Authorization": f"Token {self.settings.deepgram_api_key}"}, max_size=1_000_000) as socket:
@@ -672,10 +676,10 @@ class TwilioVoiceCall:
                             self.metrics.tts_first_audio_ms_total += first_audio_ms
                             self.metrics.tts_first_audio_count += 1
                             self.metrics.end_of_turn_to_first_audio_samples.append(first_audio_ms)
-                        twilio_audio, resample_state = deepgram_linear16_to_twilio_mulaw(
-                            raw,
-                            resample_state,
-                        )
+                        if getattr(self.settings, "twilio_native_mulaw", True):
+                            twilio_audio = raw
+                        else:
+                            twilio_audio, resample_state = deepgram_linear16_to_twilio_mulaw(raw, resample_state)
                         # Twilio permits any payload size; bounded 200 ms chunks
                         # reduce jitter and make clear/mark interruption prompt.
                         for offset in range(0, len(twilio_audio), 1600):
