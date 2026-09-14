@@ -436,6 +436,9 @@ class TwilioVoiceCall:
             response = await self.http.post(
                 self.settings.chusky_turn_url,
                 headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                # The bridge always commits the definitive result itself. Keep
+                # this legacy batch request speculative so it never writes a
+                # second copy before _commit_turn obtains its idempotent lease.
                 json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "speculative": True},
                 timeout=httpx.Timeout(45.0, connect=10.0),
             )
@@ -593,7 +596,40 @@ class TwilioVoiceCall:
             except Exception:
                 pass
 
+    async def _commit_turn(self, transcript: str, result: VoiceTurnResult, turn_index: int) -> None:
+        """Commit one completed response without ever asking Chusky to answer twice.
+
+        The Chusky endpoint owns idempotency by call and Flux turn index. A
+        retry therefore has the exact same transcript, answer, and cost; a
+        temporary busy lease or a 5xx cannot create duplicate history or
+        duplicate caller speech.
+        """
+        url = f"{self.settings.chusky_turn_url[:-len('/turn')]}/commit-turn"
+        payload = {
+            "callId": self.call_id, "userId": self.user_id, "transcript": transcript,
+            "text": result.text, "cost": result.cost, "turnId": f"{turn_index}",
+        }
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = await self.http.post(
+                    url,
+                    headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                    json=payload,
+                    timeout=httpx.Timeout(15.0, connect=5.0),
+                )
+                response.raise_for_status()
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                last_error = error
+                if attempt < 2:
+                    await asyncio.sleep(0.15 * (attempt + 1))
+        raise RuntimeError("voice turn commit did not complete") from last_error
+
     async def _respond_final(self, transcript: str, turn_index: int) -> None:
+        result: VoiceTurnResult | None = None
         try:
             matching_draft = bool(
                 self.draft_task
@@ -623,14 +659,15 @@ class TwilioVoiceCall:
                 result = await self._request_agent_stream(transcript, speculative=False)
             if not result.text or self.interrupted:
                 return
-            response = await self.http.post(
-                f"{self.settings.chusky_turn_url[:-len('/turn')]}/commit-turn",
-                headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
-                json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "text": result.text, "cost": result.cost, "turnId": f"{turn_index}"},
-                timeout=httpx.Timeout(15.0, connect=5.0),
-            )
-            response.raise_for_status()
+            await self._commit_turn(transcript, result, turn_index)
         except Exception:
+            # The caller may already have heard the completed streamed answer.
+            # Never generate or speak another answer merely because durable
+            # history persistence is temporarily unavailable.
+            if result is not None:
+                self.metrics.agent_failures += 1
+                LOG.warning("Twilio voice turn commit failed", extra={"call_id": self.call_id})
+                return
             # A provider or bridge deployment may not have the new streaming
             # route yet. Keep the call usable through the proven batch path.
             if not self.interrupted and not self.tts_first_audio_recorded:
@@ -638,13 +675,7 @@ class TwilioVoiceCall:
                     await self._close_persistent_tts()
                     result = await self._request_agent(transcript)
                     if result.text:
-                        response = await self.http.post(
-                            f"{self.settings.chusky_turn_url[:-len('/turn')]}/commit-turn",
-                            headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
-                            json={"callId": self.call_id, "userId": self.user_id, "transcript": transcript, "text": result.text, "cost": result.cost, "turnId": f"{turn_index}"},
-                            timeout=httpx.Timeout(15.0, connect=5.0),
-                        )
-                        response.raise_for_status()
+                        await self._commit_turn(transcript, result, turn_index)
                         await self._speak(result.text)
                 except Exception:
                     self.metrics.agent_failures += 1

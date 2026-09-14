@@ -28,9 +28,10 @@ is independent of the Flux STT configuration used for Twilio telephone calls.
 
 It also accepts a separate **Twilio bidirectional Media Stream** at
 `/twilio/stream`. Twilio's wire format remains base64 `audio/x-mulaw` at 8 kHz.
-For this route, the bridge decodes and resamples caller audio to 48 kHz linear16
-for Deepgram Flux, then resamples Deepgram's 24 kHz linear16 speech and encodes
-it back to Twilio's required 8 kHz μ-law. Chusky's authenticated backend remains
+By default the bridge keeps that native μ-law/8 kHz format through Deepgram Flux
+STT and TTS, avoiding per-frame resampling in the live path. Set
+`VOICE_TWILIO_NATIVE_MULAW=false` only as a deliberate compatibility rollback
+to the legacy linear16 conversion path. Chusky's authenticated backend remains
 the only agent brain and supplies its existing history, memory, and tools.
 
 ## Required environment

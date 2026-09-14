@@ -135,6 +135,28 @@ class FakeAgentHttp:
         return None
 
 
+class CommitRetryHttp:
+    def __init__(self, failures: int):
+        self.failures = failures
+        self.attempts = 0
+
+    async def post(self, _url, **_kwargs):
+        self.attempts += 1
+
+        class Response:
+            def __init__(self, fail):
+                self.fail = fail
+
+            def raise_for_status(self):
+                if self.fail:
+                    raise RuntimeError("temporary commit failure")
+
+        return Response(self.attempts <= self.failures)
+
+    async def aclose(self):
+        return None
+
+
 class DeepgramTurnSocket:
     def __init__(self, events):
         self.events = events
@@ -289,6 +311,15 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
         latency = self.call.metrics.snapshot(1)["twilio"]["latencyMs"]
         self.assertEqual(latency["eagerToFirstAudio"]["count"], 1)
         self.assertEqual(latency["endOfTurnToFirstAudio"]["count"], 1)
+
+    async def test_final_turn_commit_retries_the_exact_payload_without_regenerating_speech(self):
+        retrying_http = CommitRetryHttp(failures=2)
+        self.call.http = retrying_http
+        result = voice_app.VoiceTurnResult(text="I will send the details in Telegram.", cost=0.01)
+
+        await self.call._commit_turn("Please send the details.", result, 7)
+
+        self.assertEqual(retrying_http.attempts, 3)
 
 
 if __name__ == "__main__":
