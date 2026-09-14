@@ -43,7 +43,7 @@ from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
 from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, default_meeting_greeting, flux_turn_time_bounds_ms, is_recall_invocation, parse_meeting_media_authorization, parse_meeting_tts_model
 from speech_text import normalize_voice_delta, normalize_voice_text
-from twilio_auth import valid_twilio_ticket
+from twilio_auth import valid_twilio_ticket, valid_twilio_websocket
 
 LOG = logging.getLogger("chusky.voice_bridge")
 logging.basicConfig(level=os.getenv("VOICE_BRIDGE_LOG_LEVEL", "INFO"))

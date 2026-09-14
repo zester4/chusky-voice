@@ -1,10 +1,64 @@
-"""Short-lived Twilio bridge ticket verification; intentionally stdlib-only."""
+"""Twilio Media Stream signature and short-lived bridge-ticket verification."""
 from __future__ import annotations
 
 import hashlib
 import hmac
 import re
 import time
+from urllib.parse import urlsplit
+
+
+def valid_twilio_websocket(websocket, settings) -> bool:
+    """Validate the Media Streams handshake with Twilio's official SDK.
+
+    Use the configured public WSS URL as the signature URL instead of trusting
+    forwarded Host headers. Twilio documents a trailing-slash compatibility
+    retry for Voice WSS handshakes. The stream ticket is checked separately
+    after Twilio's authenticated ``start`` message arrives.
+    """
+    auth_token = str(getattr(settings, "twilio_auth_token", "") or "").strip()
+    configured_url = str(getattr(settings, "twilio_media_stream_url", "") or "").strip()
+    try:
+        signature = str(websocket.headers.get("x-twilio-signature", "") or "").strip()
+        request_url = str(websocket.url)
+        configured = urlsplit(configured_url)
+        requested = urlsplit(request_url)
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+    if (
+        not auth_token
+        or not signature
+        or configured.scheme.lower() != "wss"
+        or not configured.hostname
+        or configured.username is not None
+        or configured.password is not None
+        or configured.query
+        or configured.fragment
+        or requested.scheme.lower() not in {"ws", "wss"}
+        or not requested.hostname
+        or requested.hostname.lower() != configured.hostname.lower()
+        or requested.path not in {"/twilio/stream", "/twilio/stream/"}
+        or requested.query
+        or requested.fragment
+        or configured.path not in {"/twilio/stream", "/twilio/stream/"}
+    ):
+        return False
+
+    try:
+        # Keep Twilio's evolving signature rules in its SDK rather than
+        # maintaining a local HMAC implementation.
+        from twilio.request_validator import RequestValidator
+
+        validator = RequestValidator(auth_token)
+        canonical_url = configured_url.rstrip("/")
+        if validator.validate(canonical_url, {}, signature):
+            return True
+        return bool(validator.validate(f"{canonical_url}/", {}, signature))
+    except Exception:
+        # A missing/broken SDK or malformed signature must fail closed; the
+        # websocket route must never become unauthenticated on validator error.
+        return False
 
 
 def valid_twilio_ticket(
