@@ -285,6 +285,9 @@ VOICE_TTS_MODEL=flux-haley-en
 CHUSKY_RECALL_TURN_STREAM_URL=https://<chusky-host>/internal/recall/turn-stream
 CHUSKY_RECALL_COMMIT_TURN_URL=https://<chusky-host>/internal/recall/commit-turn
 CHUSKY_RECALL_MEDIA_AUTHORIZE_URL=https://<chusky-host>/internal/recall/media-authorize
+# Optional; required only for meetings explicitly opted into shared-screen vision.
+RECALL_REALTIME_SECRET=<same Recall workspace verification secret as Chusky root>
+CHUSKY_RECALL_VISUAL_FRAME_URL=https://<chusky-host>/internal/recall/visual-frame
 RECALL_MAX_MEETING_SECONDS=7200
 RECALL_MAX_ACTIVE_MEETINGS=4
 RECALL_COPILOT_MIN_INTERVAL_SECONDS=4
@@ -314,12 +317,45 @@ verification secret, and ensure root has Redis, QStash, and its public HTTPS
 the dashboard/Svix secret unless Recall explicitly provides one shared workspace
 secret for both. The root service sends the AI/audio disclosure in supported
 meeting chats and handles `/chusky` commands; this voice service does not need
-any meeting-chat credentials. The same signed endpoint receives Recall's
+the workspace secret for audio-only meetings. Shared-screen understanding
+uses that same workspace secret on this service to verify Recall's video
+websocket upgrade; it must match root's `RECALL_REALTIME_SECRET`. The same
+signed endpoint receives Recall's
 `speech_on`/`speech_off` participant transitions. The voice bridge correlates
 those short-lived transitions with Deepgram word timestamps and uses a name
 only when the timing and live roster identify one participant unambiguously;
 otherwise it responds without guessing. This does not enable Recall transcript
 generation, transcript webhooks, or post-meeting transcript artifacts.
+
+The main service's `/recall/health` reports Recall audio availability; screen
+understanding is an optional per-meeting capability and requires the visual
+handoff URL and valid workspace verification secret on this voice service,
+plus participant-disclosure/chat readiness on the main service. Audio-only
+meetings continue to work when these optional visual settings are absent.
+
+### Opt-in meeting screen understanding
+
+The owner must explicitly ask Chusky to inspect or discuss slides, a shared
+screen, or a visual demo. Chusky then sets `analyzeScreenShare=true` on that
+meeting's join request. This is available for Zoom, Google Meet, and Microsoft
+Teams only; Recall's separate real-time video feature does not support Webex.
+It adds Recall video resources and is not enabled for ordinary joins or
+calendar auto-joins. No additional static Recall dashboard webhook is required:
+the bot's Create Bot request registers a signed `wss://<voice-host>/recall/video`
+endpoint for `video_separate_png.data`. The shared Recall workspace verification
+secret must be configured on both root and voice services.
+
+Recall sends separate PNG frames at 360p/2fps. The voice receiver verifies the
+signed websocket handshake, ignores webcam frames, samples changed images no
+more often than every 2.5 seconds, and refreshes an unchanged screen at most
+once every 8 seconds. Root checks the meeting owner, provider bot ID,
+in-call state, and explicit opt-in, then encrypts the latest frame in a Redis
+cache with a 12-second TTL. This lets consecutive spoken turns inspect a
+static slide without retaining or accumulating screenshots. Frame bytes are
+never placed in meeting history, transcripts, logs, or a durable media
+artifact. The bridge treats visible slide text as untrusted content. If no
+fresh frame is available when a turn starts, Chusky responds using speech
+context only.
 
 ### Staging smoke test
 

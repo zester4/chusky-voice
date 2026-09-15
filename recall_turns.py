@@ -116,6 +116,41 @@ class MeetingContextWindow:
         ]
 
 
+def build_meeting_outcome_payload(meeting_id: Any, user_id: Any, context: Any) -> dict[str, Any]:
+    """Project the transient in-call window into the narrow Chusky outcome API shape."""
+    if not isinstance(meeting_id, str) or not re.fullmatch(r"mtg_[A-Za-z0-9_-]{1,80}", meeting_id):
+        raise ValueError("invalid meeting outcome identity")
+    if not isinstance(user_id, int) or isinstance(user_id, bool) or user_id <= 0:
+        raise ValueError("invalid meeting outcome owner")
+    if not isinstance(context, list) or not 1 <= len(context) <= 32:
+        raise ValueError("meeting outcome context must contain 1-32 turns")
+    bounded: list[dict[str, str]] = []
+    total_chars = 0
+    for turn in context:
+        if not isinstance(turn, dict) or turn.get("role") not in ("participant", "chusky"):
+            raise ValueError("meeting outcome turn is invalid")
+        text = turn.get("text")
+        if not isinstance(text, str):
+            raise ValueError("meeting outcome turn is invalid")
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text or len(text) > 1_000:
+            raise ValueError("meeting outcome turn exceeds bounds")
+        total_chars += len(text)
+        if total_chars > 12_000:
+            raise ValueError("meeting outcome context exceeds bounds")
+        safe_turn = {"role": turn["role"], "text": text}
+        speaker = turn.get("speakerName")
+        if speaker is not None:
+            if turn["role"] != "participant" or not isinstance(speaker, str):
+                raise ValueError("meeting outcome speaker label is invalid")
+            speaker = re.sub(r"[\x00-\x1f\x7f]", " ", re.sub(r"\s+", " ", speaker)).strip()[:160]
+            if not speaker:
+                raise ValueError("meeting outcome speaker label is invalid")
+            safe_turn["speakerName"] = speaker
+        bounded.append(safe_turn)
+    return {"meetingId": meeting_id, "userId": user_id, "context": bounded}
+
+
 def flux_turn_time_bounds_ms(stream_started_at: float | None, event: dict[str, Any]) -> tuple[int, int] | None:
     """Map Deepgram's stream-relative word times to UTC milliseconds for Recall correlation."""
     if not isinstance(stream_started_at, (int, float)) or isinstance(stream_started_at, bool) or not math.isfinite(stream_started_at) or stream_started_at <= 0:

@@ -41,7 +41,8 @@ from audio_formats import (
 )
 from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
-from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, default_meeting_greeting, flux_turn_time_bounds_ms, is_recall_invocation, parse_meeting_media_authorization, parse_meeting_tts_model
+from recall_video import RecallScreenShareSampler, parse_screenshare_frame, valid_visual_handoff_url, verify_recall_websocket_signature, visual_configuration_status
+from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, build_meeting_outcome_payload, default_meeting_greeting, flux_turn_time_bounds_ms, is_recall_invocation, parse_meeting_media_authorization, parse_meeting_tts_model
 from speech_text import normalize_voice_delta, normalize_voice_text
 from twilio_auth import valid_twilio_ticket, valid_twilio_websocket
 
@@ -101,6 +102,8 @@ class RecallSettings:
     turn_stream_url: str
     commit_turn_url: str
     media_authorize_url: str
+    visual_frame_url: str
+    realtime_secret: str
     stt_model: str
     stt_eager_eot_threshold: float
     stt_eot_threshold: float
@@ -121,6 +124,8 @@ class RecallSettings:
         turn_url = os.getenv("CHUSKY_RECALL_TURN_STREAM_URL", "").strip()
         commit_url = os.getenv("CHUSKY_RECALL_COMMIT_TURN_URL", "").strip()
         authorize_url = os.getenv("CHUSKY_RECALL_MEDIA_AUTHORIZE_URL", "").strip()
+        visual_frame_url = os.getenv("CHUSKY_RECALL_VISUAL_FRAME_URL", "").strip()
+        realtime_secret = os.getenv("RECALL_REALTIME_SECRET", "").strip()
         invalid_fields = []
         if len(secret.encode("utf-8")) < 32:
             invalid_fields.append("RECALL_MEDIA_BRIDGE_SECRET")
@@ -141,7 +146,7 @@ class RecallSettings:
         if stt not in {"nova-3", "flux-general-en"} or not tts.startswith("flux-"):
             raise RecallConfigurationError("meeting_models_invalid", ("RECALL_STT_MODEL", "VOICE_TTS_MODEL"))
         return cls(
-            secret, deepgram, turn_url, commit_url, authorize_url, stt,
+            secret, deepgram, turn_url, commit_url, authorize_url, visual_frame_url, realtime_secret, stt,
             max(0.3, min(float(os.getenv("VOICE_STT_EAGER_EOT_THRESHOLD", "0.45")), 0.9)),
             max(0.5, min(float(os.getenv("VOICE_STT_EOT_THRESHOLD", "0.65")), 0.9)),
             max(500, min(int(os.getenv("VOICE_STT_EOT_TIMEOUT_MS", "800")), 60_000)),
@@ -830,6 +835,7 @@ class RecallVoiceSession:
                 if self.response_task and not self.response_task.done():
                     self.response_task.cancel()
                     await asyncio.gather(self.response_task, return_exceptions=True)
+                await self._commit_outcome_transcript()
                 for socket in (self.stt_socket, self.tts_socket):
                     if socket is not None:
                         try:
@@ -837,6 +843,47 @@ class RecallVoiceSession:
                         except Exception:
                             pass
                 self.stt_socket = self.tts_socket = None
+
+    async def _commit_outcome_transcript(self) -> None:
+        """Send only the bounded private transcript window for post-meeting outcomes."""
+        if self.interaction_mode not in ("copilot", "representative"):
+            return
+        context = self.context.snapshot()
+        if not context:
+            return
+        try:
+            payload = build_meeting_outcome_payload(self.meeting_id, self.user_id, context)
+        except ValueError:
+            LOG.warning("Recall outcome transcript rejected locally", extra={"meeting_id": self.meeting_id})
+            return
+        endpoint = self.settings.commit_turn_url.rstrip("/").removesuffix("/commit-turn") + "/commit-transcript"
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = await self.http.post(
+                    endpoint,
+                    headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                    json=payload,
+                    timeout=httpx.Timeout(10.0, connect=5.0),
+                )
+                response.raise_for_status()
+                return
+            except asyncio.CancelledError:
+                raise
+            except httpx.HTTPStatusError as error:
+                last_error = error
+                status_code = error.response.status_code
+                if status_code < 500 and status_code != 429:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(0.15 * (attempt + 1))
+            except httpx.RequestError as error:
+                last_error = error
+                if attempt < 2:
+                    await asyncio.sleep(0.15 * (attempt + 1))
+        # Never log transcript text or provider payload; the outcome workflow
+        # falls back to already-committed spoken turns if this best-effort flush fails.
+        LOG.warning("Could not commit Recall outcome transcript", extra={"meeting_id": self.meeting_id, "error_type": type(last_error).__name__ if last_error else "UnknownError"})
 
     async def _receive_browser(self) -> None:
         ready = False
@@ -1251,6 +1298,10 @@ class RecallMetrics:
     media_authorization_timeouts: int = 0
     media_authorization_rejections: int = 0
     initialization_failures: int = 0
+    screen_share_websocket_sessions: int = 0
+    screen_share_frames_sampled: int = 0
+    screen_share_frames_forwarded: int = 0
+    screen_share_frames_dropped: int = 0
 
     def snapshot(self, active_meetings: int) -> dict[str, Any]:
         return {
@@ -1273,6 +1324,10 @@ class RecallMetrics:
             "mediaAuthorizationTimeouts": self.media_authorization_timeouts,
             "mediaAuthorizationRejections": self.media_authorization_rejections,
             "initializationFailures": self.initialization_failures,
+            "screenShareWebsocketSessions": self.screen_share_websocket_sessions,
+            "screenShareFramesSampled": self.screen_share_frames_sampled,
+            "screenShareFramesForwarded": self.screen_share_frames_forwarded,
+            "screenShareFramesDropped": self.screen_share_frames_dropped,
         }
 
 
@@ -1359,8 +1414,14 @@ async def health() -> dict[str, Any]:
 @app.get("/recall/health")
 async def recall_health() -> dict[str, Any]:
     try:
-        RecallSettings.from_env()
-        return {"ok": True, "provider": "recall", "status": "configured", "metrics": recall_metrics.snapshot(len(recall_meetings.active))}
+        settings = RecallSettings.from_env()
+        return {
+            "ok": True,
+            "provider": "recall",
+            "status": "configured",
+            "optionalFeatures": {"sharedScreenUnderstanding": visual_configuration_status(settings.visual_frame_url, settings.realtime_secret)},
+            "metrics": recall_metrics.snapshot(len(recall_meetings.active)),
+        }
     except RecallConfigurationError as exc:
         enabled = os.getenv("RECALL_MEETINGS_ENABLED", "false").strip().lower() == "true"
         return {"ok": not enabled, "provider": "recall", "status": "misconfigured" if enabled else "disabled", "configurationIssue": exc.code, "metrics": recall_metrics.snapshot(len(recall_meetings.active))}
@@ -1542,6 +1603,108 @@ async def recall_audio(websocket: WebSocket) -> None:
             await recall_meetings.release(reserved_id)
 
 
+@app.websocket("/recall/video")
+async def recall_video(websocket: WebSocket) -> None:
+    """Receive Recall's signed PNG stream and forward sampled screenshares only."""
+    accepted = False
+    handshake_slot = False
+    stage = "configuration"
+    try:
+        settings = RecallSettings.from_env()
+        if not valid_visual_handoff_url(settings.visual_frame_url) or visual_configuration_status(settings.visual_frame_url, settings.realtime_secret) != "configured":
+            await websocket.close(code=1011, reason="visual_context_not_configured")
+            return
+        if websocket.url.path != "/recall/video" or websocket.url.query:
+            await websocket.close(code=1008, reason="invalid_endpoint")
+            return
+        stage = "signature_verification"
+        try:
+            await asyncio.wait_for(recall_handshakes.acquire(), timeout=0.5)
+            handshake_slot = True
+        except asyncio.TimeoutError:
+            await websocket.close(code=1013, reason="server_busy")
+            return
+        if not verify_recall_websocket_signature(settings.realtime_secret, websocket.headers):
+            await websocket.close(code=1008, reason="invalid_recall_signature")
+            return
+        await websocket.accept()
+        accepted = True
+        recall_metrics.screen_share_websocket_sessions += 1
+        # Do not hold the shared audio/video handshake semaphore for the life
+        # of this long-lived websocket; it could otherwise block call audio.
+        recall_handshakes.release()
+        handshake_slot = False
+        sampler = RecallScreenShareSampler(min_interval_seconds=2.5)
+        stage = "receiving_frames"
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+            while True:
+                raw = await websocket.receive_text()
+                if len(raw.encode("utf-8")) > 2_050_000:
+                    recall_metrics.screen_share_frames_dropped += 1
+                    await websocket.close(code=1009, reason="frame_too_large")
+                    return
+                try:
+                    event = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    recall_metrics.screen_share_frames_dropped += 1
+                    continue
+                frame = parse_screenshare_frame(event)
+                if frame is None:
+                    # Ignore webcam, audio, chat, and malformed provider events.
+                    continue
+                if not sampler.accept(frame["buffer"]):
+                    continue
+                recall_metrics.screen_share_frames_sampled += 1
+                try:
+                    response = await client.post(
+                        settings.visual_frame_url,
+                        headers={"Authorization": f"Bearer {settings.bridge_secret}"},
+                        json={
+                            "meetingId": frame["meeting_id"],
+                            "userId": frame["user_id"],
+                            "providerBotId": frame["provider_bot_id"],
+                            "frameBase64": frame["buffer"],
+                        },
+                    )
+                    if response.status_code == 202:
+                        recall_metrics.screen_share_frames_forwarded += 1
+                    elif response.status_code in (425, 429) or response.status_code >= 500:
+                        # The meeting-status webhook can lag video startup, and
+                        # Redis/bridge failures can be transient. Retry the same
+                        # static slide on a later provider frame, still subject
+                        # to the sampler and Redis rate limit.
+                        sampler.retry()
+                        recall_metrics.screen_share_frames_dropped += 1
+                    else:
+                        recall_metrics.screen_share_frames_dropped += 1
+                        if response.status_code in (401, 404):
+                            await websocket.close(code=1008, reason="meeting_not_authorized")
+                            return
+                except httpx.HTTPError as exc:
+                    recall_metrics.screen_share_frames_dropped += 1
+                    LOG.warning(
+                        "Recall shared-screen handoff failed",
+                        extra={"stage": stage, "error_type": type(exc).__name__},
+                    )
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        LOG.warning(
+            "Recall shared-screen websocket ended",
+            extra={"stage": stage, "error_type": type(exc).__name__},
+        )
+        if accepted:
+            try:
+                await websocket.close(code=1011, reason="visual_stream_unavailable")
+            except Exception:
+                pass
+    finally:
+        if handshake_slot:
+            recall_handshakes.release()
+        if accepted:
+            recall_metrics.screen_share_websocket_sessions = max(0, recall_metrics.screen_share_websocket_sessions - 1)
+
+
 @app.websocket("/twilio/stream")
 async def twilio_stream(websocket: WebSocket) -> None:
     """Receive a signed Twilio bidirectional Media Stream.
@@ -1613,4 +1776,7 @@ if __name__ == "__main__":
         host=os.getenv("VOICE_BRIDGE_HOST", "0.0.0.0"),
         port=int(os.getenv("PORT") or os.getenv("VOICE_BRIDGE_PORT", "3004")),
         proxy_headers=True,
+        # Recall sends bounded JSON envelopes containing base64 PNG frames.
+        # Keep the server-side WebSocket limit close to our application limit.
+        ws_max_size=2_100_000,
     )
