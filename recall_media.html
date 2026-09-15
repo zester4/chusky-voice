@@ -63,11 +63,16 @@
       const initializeAudio = async () => {
         context = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
         if (context.sampleRate !== 48000) throw new Error("unsupported sample rate");
-        // Recall's Output Media browser supplies the mixed meeting audio via
-        // getUserMedia. Keep this request deliberately minimal: browser-level
-        // echo/noise processing is for a physical microphone and can suppress
-        // or distort the virtual meeting track.
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // Recall's Output Media browser supplies a virtual mixed-meeting feed,
+        // not a physical microphone. Explicitly disable microphone-oriented
+        // processing so it does not suppress or distort the meeting audio.
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+          },
+        });
         const sourceText = `class ChuskyPcmCapture extends AudioWorkletProcessor {
           constructor() { super(); this.pending = new Int16Array(960); this.used = 0; }
           process(inputs, outputs) {

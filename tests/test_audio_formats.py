@@ -2,6 +2,7 @@ import unittest
 from urllib.parse import parse_qs, urlparse
 
 from audio_formats import (
+    AUDIOOP_AVAILABLE,
     DEEPGRAM_INPUT_SAMPLE_RATE,
     DEEPGRAM_OUTPUT_SAMPLE_RATE,
     TWILIO_SAMPLE_RATE,
@@ -16,6 +17,7 @@ from audio_formats import (
 
 
 class TwilioAudioFormatTests(unittest.TestCase):
+    @unittest.skipUnless(AUDIOOP_AVAILABLE, "legacy PCM rollback codec is not installed")
     def test_twilio_twenty_ms_frame_becomes_48khz_linear16_without_duration_change(self):
         self.assertEqual(TWILIO_SAMPLE_RATE, 8000)
         self.assertEqual(DEEPGRAM_INPUT_SAMPLE_RATE, 48000)
@@ -28,6 +30,7 @@ class TwilioAudioFormatTests(unittest.TestCase):
         duration_seconds = len(pcm) / 2 / DEEPGRAM_INPUT_SAMPLE_RATE
         self.assertLess(abs(duration_seconds - 0.020), 0.00011)
 
+    @unittest.skipUnless(AUDIOOP_AVAILABLE, "legacy PCM rollback codec is not installed")
     def test_resampling_state_keeps_adjacent_twilio_frames_contiguous(self):
         state = None
         converted = bytearray()
@@ -38,6 +41,7 @@ class TwilioAudioFormatTests(unittest.TestCase):
         duration_seconds = len(converted) / 2 / DEEPGRAM_INPUT_SAMPLE_RATE
         self.assertLess(abs(duration_seconds - 1.0), 0.00011)
 
+    @unittest.skipUnless(AUDIOOP_AVAILABLE, "legacy PCM rollback codec is not installed")
     def test_24khz_linear16_is_converted_back_to_twilio_mu_law(self):
         self.assertEqual(DEEPGRAM_OUTPUT_SAMPLE_RATE, 24000)
 
@@ -46,36 +50,41 @@ class TwilioAudioFormatTests(unittest.TestCase):
 
         self.assertEqual(len(mulaw), 160)
 
+    @unittest.skipUnless(AUDIOOP_AVAILABLE, "legacy PCM rollback codec is not installed")
     def test_rejects_partial_linear16_samples(self):
         with self.assertRaises(ValueError):
             deepgram_linear16_to_twilio_mulaw(b"\x00")
 
-    def test_flux_listen_contract_uses_48khz_linear16_and_turn_detection(self):
+    def test_twilio_flux_listen_contract_uses_native_mulaw_and_turn_detection(self):
         url = twilio_deepgram_listen_url("flux-general-en", 0.45, 0.65, 800)
         query = parse_qs(urlparse(url).query)
 
         self.assertEqual(urlparse(url).path, "/v2/listen")
         self.assertEqual(query["model"], ["flux-general-en"])
-        self.assertEqual(query["encoding"], ["linear16"])
-        self.assertEqual(query["sample_rate"], ["48000"])
+        self.assertEqual(query["encoding"], ["mulaw"])
+        self.assertEqual(query["sample_rate"], ["8000"])
         self.assertEqual(query["eager_eot_threshold"], ["0.45"])
         self.assertEqual(query["eot_threshold"], ["0.65"])
         self.assertEqual(query["eot_timeout_ms"], ["800"])
 
-        # Recall's webpage supplies the same 48 kHz mono PCM directly, without
-        # Twilio's μ-law conversion; both transports share the Flux contract.
+        # Recall supplies its own 48 kHz mono PCM directly and keeps a
+        # separate Flux contract from Twilio's native μ-law transport.
         recall_url = deepgram_flux_listen_url("flux-general-en", 0.45, 0.65, 800)
-        self.assertEqual(parse_qs(urlparse(recall_url).query), query)
+        recall_query = parse_qs(urlparse(recall_url).query)
+        self.assertEqual(recall_query["encoding"], ["linear16"])
+        self.assertEqual(recall_query["sample_rate"], ["48000"])
 
-    def test_flux_speak_contract_uses_24khz_linear16(self):
+    def test_twilio_flux_speak_contract_uses_native_mulaw(self):
         url = twilio_deepgram_speak_url("flux-haley-en")
         query = parse_qs(urlparse(url).query)
 
         self.assertEqual(urlparse(url).path, "/v2/speak")
         self.assertEqual(query["model"], ["flux-haley-en"])
-        self.assertEqual(query["encoding"], ["linear16"])
-        self.assertEqual(query["sample_rate"], ["24000"])
-        self.assertEqual(deepgram_flux_speak_url("flux-haley-en"), url)
+        self.assertEqual(query["encoding"], ["mulaw"])
+        self.assertEqual(query["sample_rate"], ["8000"])
+        recall_query = parse_qs(urlparse(deepgram_flux_speak_url("flux-haley-en")).query)
+        self.assertEqual(recall_query["encoding"], ["linear16"])
+        self.assertEqual(recall_query["sample_rate"], ["24000"])
 
     def test_nova_listen_contract_uses_v1_vad_endpointing_and_stable_results(self):
         url = deepgram_nova_listen_url("nova-3", 500, 1000)

@@ -6,6 +6,16 @@ import app as voice_app
 
 
 class RecallMediaPageTests(unittest.IsolatedAsyncioTestCase):
+    def test_meeting_agent_error_uses_only_known_content_free_codes(self):
+        for code in ("approval_required", "agent_run_failed"):
+            error = voice_app.RecallMeetingAgentError(code)
+            self.assertEqual(error.failure_code, code)
+            self.assertNotIn(code, str(error))
+
+        error = voice_app.RecallMeetingAgentError("participant transcript or secret")
+        self.assertEqual(error.failure_code, "agent_run_failed")
+        self.assertNotIn("participant transcript", str(error))
+
     async def test_media_page_is_served_even_when_audio_configuration_is_missing(self):
         with patch.object(
             voice_app.RecallSettings,

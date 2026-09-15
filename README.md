@@ -1,10 +1,9 @@
 # Chusky voice bridge
 
-This private service bridges Chusky to live voice calls. Twilio Media Streams
-provide the telephone calling path; an optional legacy Sendblue FaceTime path
-uses Agora. Chusky remains the agent brain: the bridge sends speech turns to
-Chusky's authenticated internal endpoint and streams its responses back to the
-caller using Deepgram.
+This private service bridges Chusky to Twilio telephone calls and Recall
+meetings. Chusky remains the agent brain: the bridge sends speech turns to
+Chusky's authenticated internal endpoints and streams responses back using
+Deepgram.
 
 The bridge runs separately from Chusky and does not replace its model, memory,
 history, or tools. For telephone calls, Chusky retains committed text turns in
@@ -29,18 +28,19 @@ is independent of the Flux STT configuration used for Twilio telephone calls.
 
 It also accepts a separate **Twilio bidirectional Media Stream** at
 `/twilio/stream`. Twilio's wire format remains base64 `audio/x-mulaw` at 8 kHz.
-For this route, the bridge decodes and resamples caller audio to 48 kHz linear16
-for Deepgram Flux, then resamples Deepgram's 24 kHz linear16 speech and encodes
-it back to Twilio's required 8 kHz μ-law. Chusky's authenticated backend remains
+By default the bridge keeps that native μ-law/8 kHz format through Deepgram Flux
+STT and TTS, avoiding per-frame resampling in the live path. Set
+`VOICE_TWILIO_NATIVE_MULAW=false` only as a deliberate compatibility rollback
+to the legacy linear16 conversion path. Chusky's authenticated backend remains
 the only agent brain and supplies its existing history, memory, and tools.
 
 ## Required environment
 
 ```ini
-FACETIME_MEDIA_BRIDGE_SECRET=<same random secret configured in Chusky>
+TWILIO_MEDIA_BRIDGE_SECRET=<same random secret configured in Chusky>
 DEEPGRAM_API_KEY=<Deepgram server API key>
-CHUSKY_VOICE_TURN_URL=http://127.0.0.1:3003/internal/facetime/turn
-CHUSKY_VOICE_STATUS_URL=http://127.0.0.1:3003/internal/facetime/status
+CHUSKY_VOICE_TURN_URL=http://127.0.0.1:3003/internal/twilio/turn
+CHUSKY_VOICE_STATUS_URL=http://127.0.0.1:3003/internal/twilio/status
 VOICE_BRIDGE_HOST=127.0.0.1
 VOICE_BRIDGE_PORT=3004
 VOICE_BRIDGE_MAX_ACTIVE_CALLS=4
@@ -62,10 +62,10 @@ https://chusky-voice-production.up.railway.app
 Add these variables to the bridge service:
 
 ```ini
-FACETIME_MEDIA_BRIDGE_SECRET=<same random secret configured in Chusky>
+TWILIO_MEDIA_BRIDGE_SECRET=<same random secret configured in Chusky>
 DEEPGRAM_API_KEY=<Deepgram server API key>
-CHUSKY_VOICE_TURN_URL=https://chusky.up.railway.app/internal/facetime/turn
-CHUSKY_VOICE_STATUS_URL=https://chusky.up.railway.app/internal/facetime/status
+CHUSKY_VOICE_TURN_URL=https://chusky.up.railway.app/internal/twilio/turn
+CHUSKY_VOICE_STATUS_URL=https://chusky.up.railway.app/internal/twilio/status
 VOICE_BRIDGE_HOST=0.0.0.0
 ```
 
@@ -73,7 +73,7 @@ Do not set a fixed `VOICE_BRIDGE_PORT` on Railway. The bridge uses Railway's
 injected `PORT`; `VOICE_BRIDGE_PORT=3004` remains the local/Oracle fallback.
 
 Generate the shared bridge secret in PowerShell. Run this once, then paste the
-same output into both Railway services as `FACETIME_MEDIA_BRIDGE_SECRET`:
+same output into both Railway services as `TWILIO_MEDIA_BRIDGE_SECRET`:
 
 ```powershell
 $bytes = [byte[]]::new(32)
@@ -83,16 +83,8 @@ $rng.Dispose()
 [Convert]::ToBase64String($bytes)
 ```
 
-On the Chusky Railway service, configure:
-
-```ini
-SENDBLUE_FACETIME_ENABLED=true
-SENDBLUE_FACETIME_NUMBER=<Sendblue FaceTime-enabled number>
-FACETIME_MEDIA_BRIDGE_URL=https://chusky-voice-production.up.railway.app
-FACETIME_MEDIA_BRIDGE_SECRET=<the same generated secret>
-```
-
-For Twilio Media Streams, also set the bridge's `TWILIO_AUTH_TOKEN` and:
+For Twilio Media Streams, configure the same `TWILIO_MEDIA_BRIDGE_SECRET` on
+Chusky, and set the bridge's `TWILIO_AUTH_TOKEN` plus:
 
 ```ini
 TWILIO_MEDIA_STREAM_URL=wss://chusky-voice-production.up.railway.app/twilio/stream
@@ -102,8 +94,7 @@ The Chusky service's `TWILIO_MEDIA_STREAM_URL` must use the same WSS URL. The
 bridge's public domain must support WebSocket upgrades. Do not expose the
 private bridge secret or place it in `.env.example`.
 
-The Sendblue FaceTime bridge URL is not the Sendblue receive webhook. Normal
-Sendblue messages still use:
+Normal Sendblue messages still use the messaging webhook:
 
 ```text
 https://chusky.up.railway.app/sendblue/webhook
@@ -114,7 +105,7 @@ https://chusky.up.railway.app/sendblue/webhook
 ```bash
 cd ~/chusky/chusky-voice
 cp .env.example .env
-# Edit .env: set the same FACETIME_MEDIA_BRIDGE_SECRET as Chusky and a Deepgram key.
+# Edit .env: set the same TWILIO_MEDIA_BRIDGE_SECRET as Chusky and a Deepgram key.
 python3 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
@@ -179,33 +170,54 @@ VOICE_BARGE_IN_MIN_CHARS=2
 VOICE_GREETING=Hi, this is Chusky. How can I help?
 ```
 
-The bridge uses Deepgram Flux conversational STT (`/v2/listen`) at 48 kHz
-linear16 and streaming Flux TTS (`/v2/speak`) at 24 kHz linear16 for Twilio.
-The bridge converts Twilio's 8 kHz μ-law frames to the STT format, and converts
-TTS frames back to Twilio's required 8 kHz μ-law. Resampling state is preserved
-across frames. Upsampling the telephone audio does not restore detail that was
-not present in Twilio's 8 kHz source; this format choice is not itself a promise
-of lower end-to-end latency. The optional Agora/FaceTime path retains its
-separate audio settings and is unaffected by the Twilio conversion.
+The bridge uses Deepgram Flux conversational STT (`/v2/listen`) and streaming
+Flux TTS (`/v2/speak`) in Twilio's native raw 8 kHz μ-law format by default.
+The authenticated Chusky service may provide the owner's selected Flux voice
+for an individual Twilio call; that choice is bound into the short-lived HMAC
+stream ticket and overrides this environment default for that call only.
+This removes the per-frame decode/resample/encode route from the telephone
+path. Set `VOICE_TWILIO_NATIVE_MULAW=false` only for a measured temporary
+rollback to the legacy 48 kHz linear16 STT / 24 kHz linear16 TTS route; it is
+not a normal deployment setting. Recall meeting audio remains an independent
+48 kHz linear PCM input / 24 kHz linear PCM output path.
 
-On `EagerEndOfTurn` the bridge starts a private, read-only draft; `TurnResumed`
-cancels it, and only the definitive `EndOfTurn` is committed to Chusky memory
-and usage. This overlaps model time with end-of-turn detection without creating
-duplicate history. When caller speech resumes while Chusky is speaking, the
-bridge cancels the active response, sends Deepgram `Interrupt`, then Twilio
-`clear`: this is barge-in. `mark` events are emitted after complete responses
-for playback tracking. `/health` exposes only aggregate latency/error/barging
-counters.
+On `EagerEndOfTurn`, the bridge starts the actual streaming Chusky response and
+feeds its first complete phrase to Flux TTS immediately. If the caller resumes,
+`TurnResumed` cancels that speculative stream, interrupts Deepgram, and clears
+Twilio's playback queue. When the final `EndOfTurn` transcript matches, the
+bridge reuses the same response and commits it once; it does not cancel the
+draft and pay for a second model generation. If no eager event arrived or the
+final transcript differs, it starts a fresh final-turn stream. Only the exact
+final transcript and completed response are committed to Chusky history and
+usage. `mark` events are emitted after complete responses for playback
+tracking.
+
+Telephone turns use the dedicated `VOICE_MODEL`, the caller's durable account
+history, and relevant private memory. Their restricted native read-only tool
+allowlist is enforced before inference; they skip Composio session discovery,
+model-metadata lookup, agent-run trace writes, connected-account listing, and
+unrelated skill/playbook loading. The live prompt keeps only a bounded recent
+history window while summaries and memory preserve longer-running context.
+OpenRouter receives a two-second latency preference, a throughput preference,
+a per-call affinity key, and optional voice-model candidates. These are routing
+preferences rather than a hard latency guarantee; model/provider time-to-first-token
+and network conditions still affect the final result.
+
+`/health` exposes only aggregate latency/error/barging counters, including
+`eagerToFirstAudio` and final-turn-to-first-audio timings. Use these to confirm
+that the speculative path is reducing silence in real authorized test calls.
 
 The Twilio health response also reports bounded rolling p50/p95 timings under
 `metrics.twilio.latencyMs`: `fluxEagerToFinal` measures the Flux confirmation
-window, `agentFirstDelta` measures bridge-to-first streamed Chusky text, and
-`endOfTurnToFirstAudio` measures caller-finished-to-first-audio. These contain
-timing samples only, not transcripts or phone numbers. Use them before changing
-Flux thresholds or the voice model so tuning targets the actual slow stage.
-They measure separate parts of the live path; use real calls to evaluate
-end-to-end responsiveness because local audio-conversion tests do not measure
-Twilio, Deepgram, network, or model latency.
+window, `agentFirstDelta` measures bridge-to-first streamed Chusky text,
+`eagerToFirstAudio` measures eager-draft-to-first-audio, and
+`endOfTurnToFirstAudio` measures caller-finished-to-first-audio (zero when the
+agent is already speaking by finalization). These contain timing samples only,
+not transcripts or phone numbers. Use them before changing Flux thresholds or
+the voice model so tuning targets the actual slow stage. They measure separate
+parts of the live path; use real calls to evaluate end-to-end responsiveness
+because local audio-conversion tests do not measure Twilio, Deepgram, network,
+or model latency.
 
 In the Twilio Console, set the purchased Twilio number's **A call comes in**
 webhook to `https://chusky.selithub.shop/twilio/inbound`, method `POST`. The
@@ -273,10 +285,18 @@ VOICE_TTS_MODEL=flux-haley-en
 CHUSKY_RECALL_TURN_STREAM_URL=https://<chusky-host>/internal/recall/turn-stream
 CHUSKY_RECALL_COMMIT_TURN_URL=https://<chusky-host>/internal/recall/commit-turn
 CHUSKY_RECALL_MEDIA_AUTHORIZE_URL=https://<chusky-host>/internal/recall/media-authorize
+# Optional; required only for meetings explicitly opted into shared-screen vision.
+RECALL_REALTIME_SECRET=<same Recall workspace verification secret as Chusky root>
+CHUSKY_RECALL_VISUAL_FRAME_URL=https://<chusky-host>/internal/recall/visual-frame
 RECALL_MAX_MEETING_SECONDS=7200
 RECALL_MAX_ACTIVE_MEETINGS=4
 RECALL_COPILOT_MIN_INTERVAL_SECONDS=4
 ```
+
+For meetings, the authenticated media-authorization response can provide that
+owner's selected Flux voice; it overrides `VOICE_TTS_MODEL` for the meeting
+session only. The Telegram `/home` voice menu changes the per-account choice,
+not the bridge-wide environment default.
 
 In the Recall dashboard for the chosen region, register a **Bot Status Change**
 webhook pointing to `https://<chusky-host>/recall/webhook`, then configure its
@@ -297,7 +317,45 @@ verification secret, and ensure root has Redis, QStash, and its public HTTPS
 the dashboard/Svix secret unless Recall explicitly provides one shared workspace
 secret for both. The root service sends the AI/audio disclosure in supported
 meeting chats and handles `/chusky` commands; this voice service does not need
-any meeting-chat credentials.
+the workspace secret for audio-only meetings. Shared-screen understanding
+uses that same workspace secret on this service to verify Recall's video
+websocket upgrade; it must match root's `RECALL_REALTIME_SECRET`. The same
+signed endpoint receives Recall's
+`speech_on`/`speech_off` participant transitions. The voice bridge correlates
+those short-lived transitions with Deepgram word timestamps and uses a name
+only when the timing and live roster identify one participant unambiguously;
+otherwise it responds without guessing. This does not enable Recall transcript
+generation, transcript webhooks, or post-meeting transcript artifacts.
+
+The main service's `/recall/health` reports Recall audio availability; screen
+understanding is an optional per-meeting capability and requires the visual
+handoff URL and valid workspace verification secret on this voice service,
+plus participant-disclosure/chat readiness on the main service. Audio-only
+meetings continue to work when these optional visual settings are absent.
+
+### Opt-in meeting screen understanding
+
+The owner must explicitly ask Chusky to inspect or discuss slides, a shared
+screen, or a visual demo. Chusky then sets `analyzeScreenShare=true` on that
+meeting's join request. This is available for Zoom, Google Meet, and Microsoft
+Teams only; Recall's separate real-time video feature does not support Webex.
+It adds Recall video resources and is not enabled for ordinary joins or
+calendar auto-joins. No additional static Recall dashboard webhook is required:
+the bot's Create Bot request registers a signed `wss://<voice-host>/recall/video`
+endpoint for `video_separate_png.data`. The shared Recall workspace verification
+secret must be configured on both root and voice services.
+
+Recall sends separate PNG frames at 360p/2fps. The voice receiver verifies the
+signed websocket handshake, ignores webcam frames, samples changed images no
+more often than every 2.5 seconds, and refreshes an unchanged screen at most
+once every 8 seconds. Root checks the meeting owner, provider bot ID,
+in-call state, and explicit opt-in, then encrypts the latest frame in a Redis
+cache with a 12-second TTL. This lets consecutive spoken turns inspect a
+static slide without retaining or accumulating screenshots. Frame bytes are
+never placed in meeting history, transcripts, logs, or a durable media
+artifact. The bridge treats visible slide text as untrusted content. If no
+fresh frame is available when a turn starts, Chusky responds using speech
+context only.
 
 ### Staging smoke test
 
@@ -364,8 +422,9 @@ private memories or account metadata. Only an enabled representative receives
 a Composio session, limited to the owner's exact direct action grants; arbitrary
 Composio discovery/execution remains unavailable. Recall's real-time
 transcription webhooks are intentionally not used for live conversation;
-Chusky uses Output Media and Deepgram Flux with its existing configured voice
-model.
+Chusky uses Output Media, Deepgram's configured STT/TTS models, and only the
+separate Recall participant speech-transition events for cautious live speaker
+attribution.
 
 Twilio remains unchanged and is not routed through Recall. `/recall/health`
 reports only configuration and active-session counts. The media page and all
@@ -389,9 +448,8 @@ at `/health`; never enable transcript or raw-audio logging for this purpose.
 
 ## Safety boundary
 
-`POST /calls` requires `Authorization: Bearer <FACETIME_MEDIA_BRIDGE_SECRET>`.
-The bridge can call only `/internal/facetime/turn`,
-`/internal/facetime/commit-turn`, and `/internal/facetime/status` with the
-same secret. Chusky validates the call ID and owner, uses the owner's existing
+The bridge calls only `/internal/twilio/turn`, `/internal/twilio/turn-stream`,
+`/internal/twilio/commit-turn`, and `/internal/twilio/status` using
+`Authorization: Bearer <TWILIO_MEDIA_BRIDGE_SECRET>`. Chusky validates the call ID and owner, uses the owner's existing
 memory, limits tools to read-only calls, and stores only committed text turns
 in normal history.

@@ -31,6 +31,23 @@ class ResolveSpeculativeDraftTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         self.assertTrue(task.cancelled())
 
+    async def test_waits_for_a_matching_streaming_draft_instead_of_restarting_inference(self):
+        started = asyncio.Event()
+
+        async def streaming_draft():
+            started.set()
+            await asyncio.sleep(0.02)
+            return "The answer is already streaming."
+
+        task = asyncio.create_task(streaming_draft())
+        await started.wait()
+
+        result = await resolve_speculative_draft(task, transcript_matches=True, grace_ms=None)
+
+        self.assertEqual(result, "The answer is already streaming.")
+        self.assertTrue(task.done())
+        self.assertFalse(task.cancelled())
+
     async def test_does_not_reuse_a_draft_for_a_different_transcript(self):
         task = asyncio.create_task(asyncio.sleep(0, result="old transcript"))
         await task
@@ -44,6 +61,16 @@ class ResolveSpeculativeDraftTests(unittest.IsolatedAsyncioTestCase):
 class TakeTtsChunkTests(unittest.TestCase):
     def test_waits_for_more_text_below_the_soft_limit(self):
         self.assertIsNone(take_tts_chunk("A short first phrase."))
+
+    def test_sends_a_short_first_chunk_without_waiting_for_48_characters(self):
+        text = "I can help you with that today"
+
+        chunk = take_tts_chunk(text)
+
+        self.assertIsNotNone(chunk)
+        spoken, remainder = chunk
+        self.assertLessEqual(len(spoken), 32)
+        self.assertEqual(spoken + remainder, text)
 
     def test_emits_at_a_word_boundary_and_preserves_all_text(self):
         text = "Here is a natural sentence that is long enough to speak before the whole answer is generated."
