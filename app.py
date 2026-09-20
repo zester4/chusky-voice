@@ -39,7 +39,13 @@ from audio_formats import (
     twilio_deepgram_speak_url,
     twilio_mulaw_to_deepgram_linear16,
 )
-from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
+from latency import (
+    latency_summary,
+    resolve_speculative_draft,
+    take_tts_chunk,
+    turn_fallback_text,
+    turn_start_deadline_exceeded,
+)
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
 from recall_video import RecallScreenShareSampler, parse_screenshare_frame, valid_visual_handoff_url, verify_recall_websocket_signature, visual_configuration_status
 from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, build_meeting_outcome_payload, default_meeting_greeting, flux_turn_time_bounds_ms, is_recall_invocation, parse_meeting_media_authorization, parse_meeting_tts_model
@@ -67,6 +73,8 @@ class Settings:
     twilio_native_mulaw: bool
     barge_in_min_chars: int
     greeting: str
+    turn_start_budget_ms: int
+    turn_fallback_enabled: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -92,6 +100,8 @@ class Settings:
             os.getenv("VOICE_TWILIO_NATIVE_MULAW", "true").strip().lower() != "false",
             max(1, min(int(os.getenv("VOICE_BARGE_IN_MIN_CHARS", "2")), 100)),
             os.getenv("VOICE_GREETING", "Hi, this is Chusky. How can I help?").strip()[:500],
+            max(4_000, min(int(os.getenv("VOICE_TURN_START_BUDGET_MS", "10000")), 20_000)),
+            os.getenv("VOICE_TURN_FALLBACK_ENABLED", "true").strip().lower() != "false",
         )
 
 
@@ -114,6 +124,8 @@ class RecallSettings:
     max_meeting_seconds: int
     max_active_meetings: int
     copilot_min_interval_seconds: int
+    turn_start_budget_ms: int
+    turn_fallback_enabled: bool
 
     @classmethod
     def from_env(cls) -> "RecallSettings":
@@ -156,6 +168,8 @@ class RecallSettings:
             max(60, min(int(os.getenv("RECALL_MAX_MEETING_SECONDS", "7200")), 14_400)),
             max(1, min(int(os.getenv("RECALL_MAX_ACTIVE_MEETINGS", "4")), 20)),
             max(1, min(int(os.getenv("RECALL_COPILOT_MIN_INTERVAL_SECONDS", "4")), 120)),
+            max(4_000, min(int(os.getenv("RECALL_TURN_START_BUDGET_MS", os.getenv("VOICE_TURN_START_BUDGET_MS", "10000"))), 20_000)),
+            os.getenv("RECALL_TURN_FALLBACK_ENABLED", "true").strip().lower() != "false",
         )
 
 
@@ -208,7 +222,7 @@ class TwilioVoiceCall:
         # creating a multi-second conversational lag.
         self.audio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
         self.response_task: asyncio.Task[None] | None = None
-        self.draft_task: asyncio.Task[VoiceTurnResult] | None = None
+        self.draft_task: asyncio.Task[VoiceTurnResult | None] | None = None
         self.draft_transcript = ""
         self.draft_turn_index: int | None = None
         self.finalized_turn_indexes: set[int] = set()
@@ -220,6 +234,7 @@ class TwilioVoiceCall:
         self.tts_reader_task: asyncio.Task[None] | None = None
         self.tts_done_event: asyncio.Event | None = None
         self.tts_first_audio_recorded = False
+        self.turn_first_audio_event: asyncio.Event | None = None
         self.stt_resample_state: object | None = None
         self.tts_resample_state: object | None = None
         self.twilio_send_lock = asyncio.Lock()
@@ -495,6 +510,8 @@ class TwilioVoiceCall:
                         else:
                             self.metrics.end_of_turn_to_first_audio_samples.append(first_audio_ms)
                         self.tts_first_audio_recorded = True
+                        if self.turn_first_audio_event is not None:
+                            self.turn_first_audio_event.set()
                     if getattr(self.settings, "twilio_native_mulaw", True):
                         twilio_audio = raw
                     else:
@@ -524,7 +541,48 @@ class TwilioVoiceCall:
             if flush:
                 await self.tts_socket.send(json.dumps({"type": "Flush"}))
 
-    async def _request_agent_stream(self, transcript: str, *, speculative: bool = False) -> VoiceTurnResult:
+    async def _request_agent_stream(self, transcript: str, *, speculative: bool = False) -> VoiceTurnResult | None:
+        """Stream one answer, guarding only the time before speech begins.
+
+        Speculative eager turns are never given a spoken fallback: they may be
+        canceled and replaced by the definitive EndOfTurn request. A final
+        turn may use a short recovery line when no audio has started within
+        the configured budget; that line is intentionally not committed as
+        the agent's substantive answer.
+        """
+        self.turn_first_audio_event = asyncio.Event()
+        stream_task = asyncio.create_task(
+            self._consume_agent_stream(transcript, speculative=speculative),
+            name=f"twilio-agent-stream-{self.call_id}",
+        )
+        try:
+            if not speculative and getattr(self.settings, "turn_fallback_enabled", True):
+                budget_ms = getattr(self.settings, "turn_start_budget_ms", 10_000)
+                budget_started_at = time.monotonic()
+                try:
+                    await asyncio.wait_for(self.turn_first_audio_event.wait(), timeout=max(1, int(budget_ms)) / 1000)
+                except asyncio.TimeoutError:
+                    if turn_start_deadline_exceeded(
+                        budget_started_at,
+                        time.monotonic(),
+                        budget_ms,
+                        self.tts_first_audio_recorded,
+                        self.interrupted,
+                    ) and not self.interrupted and not self.tts_first_audio_recorded:
+                        stream_task.cancel()
+                        await asyncio.gather(stream_task, return_exceptions=True)
+                        self.metrics.turn_start_budget_exceeded += 1
+                        await self._speak_slow_turn_fallback()
+                        return None
+                    raise
+            return await stream_task
+        finally:
+            if not stream_task.done():
+                stream_task.cancel()
+                await asyncio.gather(stream_task, return_exceptions=True)
+            self.turn_first_audio_event = None
+
+    async def _consume_agent_stream(self, transcript: str, *, speculative: bool = False) -> VoiceTurnResult:
         started = time.monotonic()
         buffer = ""
         full_text = ""
@@ -581,6 +639,21 @@ class TwilioVoiceCall:
         except Exception:
             self.metrics.agent_failures += 1
             raise
+
+    async def _speak_slow_turn_fallback(self) -> None:
+        """Recover from a silent model turn without exposing transport errors."""
+        try:
+            if self.tts_socket is not None:
+                async with self.tts_lock:
+                    await self.tts_socket.send(json.dumps({"type": "Interrupt"}))
+            await self._send_twilio({"event": "clear", "streamSid": self.stream_sid})
+        except Exception:
+            pass
+        await self._close_persistent_tts()
+        self.interrupted = False
+        self.metrics.turn_fallbacks += 1
+        self.response_started_at = time.monotonic()
+        await self._speak(turn_fallback_text(self.metrics.turn_fallbacks - 1))
 
     async def _speak_persistent_text(self, text: str) -> None:
         self.tts_done_event = asyncio.Event()
@@ -662,7 +735,7 @@ class TwilioVoiceCall:
                 result = None
             if result is None:
                 result = await self._request_agent_stream(transcript, speculative=False)
-            if not result.text or self.interrupted:
+            if result is None or not result.text or self.interrupted:
                 return
             await self._commit_turn(transcript, result, turn_index)
         except Exception:
@@ -768,6 +841,8 @@ class RecallVoiceSession:
         self.stt_socket: Any = None
         self.tts_socket: Any = None
         self.tts_done_event: asyncio.Event | None = None
+        self.turn_first_audio_event: asyncio.Event | None = None
+        self.tts_first_audio_recorded = False
         self.response_task: asyncio.Task[None] | None = None
         self.response_started_at = 0.0
         self.interrupted = False
@@ -1110,6 +1185,10 @@ class RecallVoiceSession:
             async for raw in self.tts_socket:
                 if isinstance(raw, bytes):
                     if not self.interrupted and not self.stop.is_set():
+                        if not self.tts_first_audio_recorded:
+                            self.tts_first_audio_recorded = True
+                            if self.turn_first_audio_event is not None:
+                                self.turn_first_audio_event.set()
                         await self._send_bytes(raw)
                         self.metrics.tts_audio_frames += 1
                         self.metrics.tts_audio_bytes += len(raw)
@@ -1138,9 +1217,24 @@ class RecallVoiceSession:
 
     async def _speak(self, text: str) -> None:
         self.tts_done_event = asyncio.Event()
+        self.tts_first_audio_recorded = False
         self.echo_guard.remember_output(text)
         await self._send_tts(text, flush=True)
         await asyncio.wait_for(self.tts_done_event.wait(), timeout=45.0)
+
+    async def _speak_slow_turn_fallback(self) -> None:
+        """Keep a meeting conversational when a response has not started."""
+        try:
+            if self.tts_socket is not None:
+                async with self.tts_lock:
+                    await self.tts_socket.send(json.dumps({"type": "Interrupt"}))
+            await self._send_text({"type": "clear"})
+        except Exception:
+            pass
+        self.interrupted = False
+        self.metrics.turn_fallbacks += 1
+        self.response_started_at = time.monotonic()
+        await self._speak(turn_fallback_text(self.metrics.turn_fallbacks - 1))
 
     async def _respond(
         self,
@@ -1162,76 +1256,103 @@ class RecallVoiceSession:
         speaking = self.interaction_mode == "addressed"
         received_delta = False
         started = time.monotonic()
+        budget_ms = getattr(self.settings, "turn_start_budget_ms", 10_000)
+        budget_started_at: float | None = started if speaking else None
+        self.turn_first_audio_event = asyncio.Event()
+        self.tts_first_audio_recorded = False
         async with httpx.AsyncClient(timeout=httpx.Timeout(65.0, connect=8.0)) as client:
-            async with client.stream(
-                "POST",
-                self.settings.turn_stream_url,
-                headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
-                json={
-                    "meetingId": self.meeting_id,
-                    "userId": self.user_id,
-                    "transcript": transcript,
-                    "context": context,
-                    "interactionMode": self.interaction_mode,
-                    **({"turnStartedAtMs": turn_started_at_ms, "turnEndedAtMs": turn_ended_at_ms} if turn_started_at_ms is not None and turn_ended_at_ms is not None else {}),
-                },
-            ) as response:
-                if response.status_code != 200:
-                    LOG.warning(
-                        "Recall turn-stream returned HTTP %d (check RECALL_MEDIA_BRIDGE_SECRET and meeting in_call status)",
-                        response.status_code,
-                        extra={"meeting_id": self.meeting_id},
-                    )
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
-                    event = json.loads(line)
-                    if event.get("type") == "speaker":
-                        self.context.set_speaker(context_turn_id, event.get("name"))
-                    elif event.get("type") == "delta":
-                        if not speaking:
+            try:
+                async with client.stream(
+                    "POST",
+                    self.settings.turn_stream_url,
+                    headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                    json={
+                        "meetingId": self.meeting_id,
+                        "userId": self.user_id,
+                        "transcript": transcript,
+                        "context": context,
+                        "interactionMode": self.interaction_mode,
+                        **({"turnStartedAtMs": turn_started_at_ms, "turnEndedAtMs": turn_ended_at_ms} if turn_started_at_ms is not None and turn_ended_at_ms is not None else {}),
+                    },
+                ) as response:
+                    if response.status_code != 200:
+                        LOG.warning(
+                            "Recall turn-stream returned HTTP %d (check RECALL_MEDIA_BRIDGE_SECRET and meeting in_call status)",
+                            response.status_code,
+                            extra={"meeting_id": self.meeting_id},
+                        )
+                    response.raise_for_status()
+                    lines = response.aiter_lines().__aiter__()
+                    while True:
+                        try:
+                            if budget_started_at is not None and not self.tts_first_audio_recorded and getattr(self.settings, "turn_fallback_enabled", True):
+                                remaining = max(0.001, float(max(1, int(budget_ms))) / 1000 - (time.monotonic() - budget_started_at))
+                                if turn_start_deadline_exceeded(budget_started_at, time.monotonic(), budget_ms, self.tts_first_audio_recorded, self.interrupted):
+                                    raise asyncio.TimeoutError
+                                line = await asyncio.wait_for(lines.__anext__(), timeout=remaining)
+                            else:
+                                line = await lines.__anext__()
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            if not self.interrupted and not self.tts_first_audio_recorded and getattr(self.settings, "turn_fallback_enabled", True):
+                                self.metrics.turn_start_budget_exceeded += 1
+                                await self._speak_slow_turn_fallback()
+                                return
+                            raise
+                        if not line:
                             continue
-                        delta = normalize_voice_delta(str(event.get("text") or ""))
-                        if not delta:
-                            continue
-                        received_delta = True
-                        full_text += delta
-                        buffer += delta
-                        if any(buffer.rstrip().endswith(mark) for mark in (".", "!", "?", ":", ";")):
-                            self.echo_guard.remember_output(buffer)
-                            await self._send_tts(buffer)
-                            buffer = ""
-                        elif len(buffer) >= 120:
-                            self.echo_guard.remember_output(buffer)
-                            await self._send_tts(buffer)
-                            buffer = ""
-                    elif event.get("type") == "silent":
-                        self.metrics.agent_silent += 1
-                        speaking = False
-                        full_text = ""
-                        buffer = ""
-                    elif event.get("type") == "speak":
-                        self.metrics.agent_speaking += 1
-                        speaking = True
-                        received_done = False
-                    elif event.get("type") == "mode":
-                        if event.get("mode") == "addressed":
-                            self.interaction_mode = "addressed"
-                        await self._send_text({"type": "mode", "mode": self.interaction_mode, "reason": event.get("reason")})
-                    elif event.get("type") == "done":
-                        cost = max(0.0, min(float(event.get("cost") or 0), 10.0))
-                        received_done = True
-                        if event.get("speak") is False:
+                        event = json.loads(line)
+                        if event.get("type") == "speaker":
+                            self.context.set_speaker(context_turn_id, event.get("name"))
+                        elif event.get("type") == "delta":
+                            if not speaking:
+                                continue
+                            delta = normalize_voice_delta(str(event.get("text") or ""))
+                            if not delta:
+                                continue
+                            received_delta = True
+                            full_text += delta
+                            buffer += delta
+                            if any(buffer.rstrip().endswith(mark) for mark in (".", "!", "?", ":", ";")):
+                                self.echo_guard.remember_output(buffer)
+                                await self._send_tts(buffer)
+                                buffer = ""
+                            elif len(buffer) >= 120:
+                                self.echo_guard.remember_output(buffer)
+                                await self._send_tts(buffer)
+                                buffer = ""
+                        elif event.get("type") == "silent":
+                            self.metrics.agent_silent += 1
                             speaking = False
+                            budget_started_at = None
                             full_text = ""
                             buffer = ""
-                        elif speaking and not received_delta:
-                            fallback_text = normalize_voice_text(str(event.get("text") or ""))[:5000]
-                            full_text = fallback_text
-                            buffer = fallback_text
-                    elif event.get("type") == "error":
-                        raise RecallMeetingAgentError(event.get("code"))
+                        elif event.get("type") == "speak":
+                            self.metrics.agent_speaking += 1
+                            speaking = True
+                            received_done = False
+                            budget_started_at = time.monotonic()
+                        elif event.get("type") == "mode":
+                            if event.get("mode") == "addressed":
+                                self.interaction_mode = "addressed"
+                            await self._send_text({"type": "mode", "mode": self.interaction_mode, "reason": event.get("reason")})
+                        elif event.get("type") == "done":
+                            cost = max(0.0, min(float(event.get("cost") or 0), 10.0))
+                            received_done = True
+                            if event.get("speak") is False:
+                                speaking = False
+                                budget_started_at = None
+                                full_text = ""
+                                buffer = ""
+                            elif speaking and not received_delta:
+                                fallback_text = normalize_voice_text(str(event.get("text") or ""))[:5000]
+                                full_text = fallback_text
+                                buffer = fallback_text
+                        elif event.get("type") == "error":
+                            raise RecallMeetingAgentError(event.get("code"))
+            finally:
+                self.turn_first_audio_event = None
         full_text = normalize_voice_text(full_text)[:5000]
         if not received_done:
             return
@@ -1291,6 +1412,8 @@ class RecallMetrics:
     agent_speaking: int = 0
     agent_silent: int = 0
     agent_failures: int = 0
+    turn_start_budget_exceeded: int = 0
+    turn_fallbacks: int = 0
     tts_audio_frames: int = 0
     tts_audio_bytes: int = 0
     invalid_ticket_rejections: int = 0
@@ -1317,6 +1440,8 @@ class RecallMetrics:
             "agentSpeaking": self.agent_speaking,
             "agentSilent": self.agent_silent,
             "agentFailures": self.agent_failures,
+            "turnStartBudgetExceeded": self.turn_start_budget_exceeded,
+            "turnFallbacks": self.turn_fallbacks,
             "ttsAudioFrames": self.tts_audio_frames,
             "ttsAudioBytes": self.tts_audio_bytes,
             "invalidTicketRejections": self.invalid_ticket_rejections,
@@ -1341,6 +1466,8 @@ class BridgeMetrics:
     agent_turns: int = 0
     agent_turn_ms_total: int = 0
     agent_failures: int = 0
+    turn_start_budget_exceeded: int = 0
+    turn_fallbacks: int = 0
     tts_first_audio_count: int = 0
     tts_first_audio_ms_total: int = 0
     flux_eager_to_final_samples: deque[int] = field(default_factory=lambda: deque(maxlen=256))
@@ -1358,6 +1485,8 @@ class BridgeMetrics:
                 "bargeIns": self.barge_ins,
                 "droppedInboundFrames": self.dropped_inbound_frames,
                 "agentFailures": self.agent_failures,
+                "turnStartBudgetExceeded": self.turn_start_budget_exceeded,
+                "turnFallbacks": self.turn_fallbacks,
                 "averageAgentTurnMs": round(self.agent_turn_ms_total / self.agent_turns) if self.agent_turns else None,
                 "averageTtsFirstAudioMs": round(self.tts_first_audio_ms_total / self.tts_first_audio_count) if self.tts_first_audio_count else None,
                 "latencyMs": {

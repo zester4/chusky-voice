@@ -1,7 +1,13 @@
 import asyncio
 import unittest
 
-from latency import latency_summary, resolve_speculative_draft, take_tts_chunk
+from latency import (
+    latency_summary,
+    resolve_speculative_draft,
+    take_tts_chunk,
+    turn_fallback_text,
+    turn_start_deadline_exceeded,
+)
 
 
 class ResolveSpeculativeDraftTests(unittest.IsolatedAsyncioTestCase):
@@ -100,6 +106,27 @@ class LatencySummaryTests(unittest.TestCase):
 
     def test_empty_latency_samples_are_reported_as_unavailable(self):
         self.assertEqual(latency_summary([]), {"count": 0, "average": None, "p50": None, "p95": None})
+
+
+class TurnStartBudgetTests(unittest.TestCase):
+    def test_deadline_only_applies_before_first_audio(self):
+        self.assertTrue(turn_start_deadline_exceeded(100.0, 112.0, 12_000, False, False))
+        self.assertFalse(turn_start_deadline_exceeded(100.0, 112.0, 12_000, True, False))
+
+    def test_interrupted_turn_never_triggers_a_fallback(self):
+        self.assertFalse(turn_start_deadline_exceeded(100.0, 130.0, 10_000, False, True))
+
+    def test_fallback_is_short_and_conversational(self):
+        first = turn_fallback_text(0)
+        second = turn_fallback_text(1)
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertNotEqual(first, second)
+        self.assertLessEqual(len(first), 160)
+        self.assertLessEqual(len(second), 160)
+        self.assertNotIn("timeout", first.lower())
+        self.assertNotIn("error", second.lower())
 
 
 if __name__ == "__main__":

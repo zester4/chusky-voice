@@ -168,6 +168,8 @@ VOICE_STT_EOT_TIMEOUT_MS=800
 VOICE_TTS_MODEL=flux-haley-en
 VOICE_BARGE_IN_MIN_CHARS=2
 VOICE_GREETING=Hi, this is Chusky. How can I help?
+VOICE_TURN_START_BUDGET_MS=10000
+VOICE_TURN_FALLBACK_ENABLED=true
 ```
 
 The bridge uses Deepgram Flux conversational STT (`/v2/listen`) and streaming
@@ -202,6 +204,17 @@ OpenRouter receives a two-second latency preference, a throughput preference,
 a per-call affinity key, and optional voice-model candidates. These are routing
 preferences rather than a hard latency guarantee; model/provider time-to-first-token
 and network conditions still affect the final result.
+
+The bridge also has a bounded response-start guard. `VOICE_TURN_START_BUDGET_MS`
+defaults to 10 seconds and applies only until the first audio frame of a final
+answer. It does not cut off a response that has already started speaking. If a
+final turn is still silent when the budget expires, the bridge cancels that
+stalled stream, clears any queued speech, and says a short natural recovery line
+without committing that line as the agent's answer. Eager speculative drafts do
+not speak a fallback; they are simply canceled and replaced by the definitive
+turn. Set `VOICE_TURN_FALLBACK_ENABLED=false` for a measured rollback to the
+previous behavior. Barge-in always cancels the active response and suppresses
+the fallback.
 
 `/health` exposes only aggregate latency/error/barging counters, including
 `eagerToFirstAudio` and final-turn-to-first-audio timings. Use these to confirm
@@ -291,12 +304,20 @@ CHUSKY_RECALL_VISUAL_FRAME_URL=https://<chusky-host>/internal/recall/visual-fram
 RECALL_MAX_MEETING_SECONDS=7200
 RECALL_MAX_ACTIVE_MEETINGS=4
 RECALL_COPILOT_MIN_INTERVAL_SECONDS=4
+RECALL_TURN_START_BUDGET_MS=10000
+RECALL_TURN_FALLBACK_ENABLED=true
 ```
 
 For meetings, the authenticated media-authorization response can provide that
 owner's selected Flux voice; it overrides `VOICE_TTS_MODEL` for the meeting
 session only. The Telegram `/home` voice menu changes the per-account choice,
 not the bridge-wide environment default.
+
+Meeting response-start handling follows the same conversational rule as calls:
+the budget applies only while an addressed or explicitly speaking response is
+still silent. Copilot turns that remain intentionally silent are not treated as
+slow responses. The meeting health payload reports
+`turnStartBudgetExceeded` and `turnFallbacks` as content-free aggregate counters.
 
 In the Recall dashboard for the chosen region, register a **Bot Status Change**
 webhook pointing to `https://<chusky-host>/recall/webhook`, then configure its

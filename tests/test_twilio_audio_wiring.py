@@ -4,7 +4,7 @@ import json
 import time
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
 
 import app as voice_app
@@ -102,6 +102,15 @@ class FakeAgentStreamResponse:
             yield line
 
 
+class HangingAgentStreamResponse:
+    def raise_for_status(self):
+        return None
+
+    async def aiter_lines(self):
+        await asyncio.Event().wait()
+        yield "never reached"
+
+
 class FakeAgentStreamContext:
     def __init__(self, response):
         self.response = response
@@ -197,6 +206,8 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
             tts_model="flux-haley-en",
             twilio_native_mulaw=True,
             greeting="",
+            turn_start_budget_ms=1000,
+            turn_fallback_enabled=True,
         )
         self.call = voice_app.TwilioVoiceCall(
             "twc_test",
@@ -320,6 +331,21 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
         await self.call._commit_turn("Please send the details.", result, 7)
 
         self.assertEqual(retrying_http.attempts, 3)
+
+    async def test_slow_final_turn_uses_recovery_line_without_committing_it(self):
+        class HangingAgentHttp(FakeAgentHttp):
+            def stream(self, method, url, **kwargs):
+                self.stream_requests.append({"method": method, "url": url, **kwargs})
+                return FakeAgentStreamContext(HangingAgentStreamResponse())
+
+        self.call.http = HangingAgentHttp()
+        fallback = AsyncMock()
+        with patch.object(self.call, "_speak_slow_turn_fallback", fallback):
+            result = await self.call._request_agent_stream("Please check that.")
+
+        self.assertIsNone(result)
+        fallback.assert_awaited_once()
+        self.assertEqual(self.call.metrics.turn_start_budget_exceeded, 1)
 
 
 if __name__ == "__main__":

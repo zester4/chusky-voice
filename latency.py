@@ -2,10 +2,48 @@
 from __future__ import annotations
 
 import asyncio
-from math import ceil
+from math import ceil, isfinite
 from typing import TypeVar
 
 T = TypeVar("T")
+
+
+_TURN_FALLBACKS = (
+    "I’m taking a moment to get that right. Give me just a second.",
+    "I’m checking that carefully now. One moment, please.",
+    "I want to make sure I answer that properly. Give me a moment.",
+)
+
+
+def turn_start_deadline_exceeded(
+    started_at: float,
+    now: float,
+    budget_ms: int,
+    first_audio_started: bool,
+    interrupted: bool,
+) -> bool:
+    """Return whether a response is still silent past its start budget.
+
+    The budget is deliberately a *time-to-first-audio* guard, not a maximum
+    answer duration. Once audio has started, the model may finish naturally.
+    Invalid clock values fail closed so a diagnostic condition cannot create a
+    surprise interruption in a live call.
+    """
+    if first_audio_started or interrupted:
+        return False
+    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(float(value)) for value in (started_at, now)):
+        return False
+    bounded_budget_ms = max(1_000, min(int(budget_ms), 60_000))
+    return float(now) - float(started_at) >= bounded_budget_ms / 1000
+
+
+def turn_fallback_text(turn_number: int = 0) -> str:
+    """Select a brief, human-sounding recovery line without exposing errors."""
+    try:
+        index = max(0, int(turn_number)) % len(_TURN_FALLBACKS)
+    except (TypeError, ValueError, OverflowError):
+        index = 0
+    return _TURN_FALLBACKS[index]
 
 
 def latency_summary(samples: list[int]) -> dict[str, int | None]:
