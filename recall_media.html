@@ -46,6 +46,7 @@
       let processor;
       let mute;
       let playbackAt = 0;
+      let meetingUnavailableMessage = "";
       const sources = new Set();
       const stopPlayback = () => {
         sources.forEach((node) => { try { node.stop(); } catch {} });
@@ -134,6 +135,11 @@
             stopPlayback();
           } else if (message.type === "status" && message.code === "meeting_not_ready") {
             setStatus("connecting", "Waiting for Chusky to be admitted to the meeting…");
+          } else if (message.type === "status" && message.code === "meeting_unavailable") {
+            meetingUnavailableMessage = typeof message.message === "string" && message.message.trim()
+              ? message.message.trim().slice(0, 320)
+              : "Meeting audio is unavailable. If the call is still open, join Chusky again.";
+            setStatus("error", meetingUnavailableMessage);
           } else if (message.type === "error") {
             setStatus("error", "Meeting audio could not be started. Check the voice service configuration.");
           }
@@ -160,7 +166,7 @@
           if (event.code === 1008 || terminalBridgeFailure || reconnectAttempts >= 4) {
             let message = "Could not restore meeting audio. Rejoin the meeting to try again.";
             if (event.code === 1008 && event.reason === "invalid_ticket") message = "Secure meeting session could not be verified. Rejoin and check the shared bridge secret.";
-            else if (event.code === 1008 && event.reason === "meeting_unavailable") message = "The meeting provider reported that Chusky is no longer active. If the call is still open, rejoin Chusky after a moment; otherwise the meeting may have ended.";
+            else if (event.code === 1008 && event.reason === "meeting_unavailable") message = meetingUnavailableMessage || "Meeting audio is unavailable. If the call is still open, join Chusky again.";
             else if (event.code === 1011 && event.reason === "bridge_auth_failed") message = "Meeting bridge authentication failed. Check that both services use the same bridge secret.";
             else if (event.code === 1011 && event.reason === "media_authorization_failed") message = "Chusky could not verify the meeting with its main service. Check the service URL and logs.";
             else if (event.code === 1011 && event.reason === "voice_service_unavailable") message = "Meeting audio could not be initialized. Please ask the meeting host to rejoin Chusky.";
