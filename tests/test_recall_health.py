@@ -1,3 +1,5 @@
+import base64
+import os
 import unittest
 from unittest.mock import patch
 
@@ -65,6 +67,22 @@ class RecallHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["status"], "misconfigured")
         self.assertEqual(result["checks"]["mediaAuthorization"], "route_missing")
+
+    def test_official_workspace_secret_name_takes_precedence_over_legacy_alias(self):
+        workspace_secret = "whsec_" + base64.b64encode(b"workspace-secret-for-tests-32-bytes").decode()
+        env = {
+            "RECALL_MEETINGS_ENABLED": "true",
+            "RECALL_MEDIA_BRIDGE_SECRET": "b" * 32,
+            "DEEPGRAM_API_KEY": "deepgram-test",
+            "CHUSKY_RECALL_TURN_STREAM_URL": "https://chusky.test/turn",
+            "CHUSKY_RECALL_COMMIT_TURN_URL": "https://chusky.test/commit",
+            "CHUSKY_RECALL_MEDIA_AUTHORIZE_URL": "https://chusky.test/authorize",
+            "RECALL_WORKSPACE_VERIFICATION_SECRET": workspace_secret,
+            "RECALL_REALTIME_SECRET": "legacy-value-that-must-not-win",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            resolved = voice_app.RecallSettings.from_env()
+        self.assertEqual(resolved.realtime_secret, workspace_secret)
 
 
 if __name__ == "__main__":

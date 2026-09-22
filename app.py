@@ -137,7 +137,9 @@ class RecallSettings:
         commit_url = os.getenv("CHUSKY_RECALL_COMMIT_TURN_URL", "").strip()
         authorize_url = os.getenv("CHUSKY_RECALL_MEDIA_AUTHORIZE_URL", "").strip()
         visual_frame_url = os.getenv("CHUSKY_RECALL_VISUAL_FRAME_URL", "").strip()
-        realtime_secret = os.getenv("RECALL_REALTIME_SECRET", "").strip()
+        # Prefer Recall's official setting name while keeping the historical
+        # Chusky name as a backwards-compatible fallback.
+        realtime_secret = os.getenv("RECALL_WORKSPACE_VERIFICATION_SECRET", "").strip() or os.getenv("RECALL_REALTIME_SECRET", "").strip()
         invalid_fields = []
         if len(secret.encode("utf-8")) < 32:
             invalid_fields.append("RECALL_MEDIA_BRIDGE_SECRET")

@@ -339,8 +339,9 @@ rooms and host admission policies still apply. Webex may need workspace-side
 setup.
 
 Optional meeting-chat support is configured on the **Chusky root service**,
-not this bridge: set `RECALL_REALTIME_SECRET` to the Recall workspace
-verification secret, and ensure root has Redis, QStash, and its public HTTPS
+not this bridge: set `RECALL_WORKSPACE_VERIFICATION_SECRET` to the Recall
+workspace verification secret (the historical `RECALL_REALTIME_SECRET` name
+remains supported), and ensure root has Redis, QStash, and its public HTTPS
 `WEBHOOK_URL`. Keep `RECALL_REALTIME_SECRET` separate from the bridge and from
 the dashboard/Svix secret unless Recall explicitly provides one shared workspace
 secret for both. The root service sends the AI/audio disclosure in supported
