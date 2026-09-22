@@ -1803,7 +1803,11 @@ async def recall_audio(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "status", "code": "meeting_not_ready"})
                 return response.status_code
 
-            authorization_status = await wait_for_media_authorization(check_media_authorization, timeout_seconds=15.0)
+            # Recall webhooks and the provider's retrieve endpoint can briefly
+            # disagree while a bot is being admitted. Keep the page pending
+            # long enough for that normal race to settle, while still bounding
+            # startup so a genuinely dead bot does not hang forever.
+            authorization_status = await wait_for_media_authorization(check_media_authorization, timeout_seconds=45.0)
         if authorization_status not in (200, 204):
             if authorization_status == 425:
                 recall_metrics.media_authorization_timeouts += 1
