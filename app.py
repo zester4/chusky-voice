@@ -1129,6 +1129,8 @@ class RecallVoiceSession:
                 if self.echo_guard.is_echo(transcript):
                     self.metrics.turns_suppressed += 1
                 elif is_recall_invocation(transcript):
+                    if turn_event == "StartOfTurn":
+                        asyncio.create_task(self._report_runtime("healthy", {}, "A participant started an addressed turn", "speech_detected"))
                     await self._interrupt()
                 if turn_event == "TurnResumed" and provider_turn_index:
                     self.eager_end_times.pop(provider_turn_index, None)
@@ -1162,6 +1164,7 @@ class RecallVoiceSession:
         self.draft_transcript = transcript
         self.draft_turn_index = provider_turn_index
         self.draft_result = None
+        asyncio.create_task(self._report_runtime("healthy", {"eager": True}, "A speculative response started after eager end-of-turn", "eager_transcript"))
         context = self.context.snapshot()
         self.draft_task = asyncio.create_task(
             self._respond(transcript, self.turn_index + 1, context, None, None, None, speculative=True),
@@ -1223,6 +1226,7 @@ class RecallVoiceSession:
         if not should_evaluate:
             self.metrics.turns_suppressed += 1
             return
+        asyncio.create_task(self._report_runtime("healthy", {}, "A final speech turn was received", "final_transcript"))
         self.turn_index += 1
         self.metrics.agent_requests += 1
         if self.response_task and not self.response_task.done():
@@ -1261,13 +1265,13 @@ class RecallVoiceSession:
             )
             asyncio.create_task(self._report_runtime("degraded", {"failed": True, "errorCode": failure_code or "agent_run_failed"}, "Meeting response entered a degraded state"))
 
-    async def _report_runtime(self, state: str, turn: dict[str, Any], summary: str) -> None:
+    async def _report_runtime(self, state: str, turn: dict[str, Any], summary: str, event_type: str | None = None) -> None:
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
                 await client.post(
                     self.settings.commit_turn_url,
                     headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
-                    json={"meetingId": self.meeting_id, "userId": self.user_id, "turnId": f"runtime-{self.turn_index}-{int(time.time() * 1000)}", "speak": False, "runtimeState": state, "turn": turn},
+                    json={"meetingId": self.meeting_id, "userId": self.user_id, "turnId": f"runtime-{self.turn_index}-{int(time.time() * 1000)}", "speak": False, "runtimeState": state, "summary": summary[:280], **({"eventType": event_type} if event_type else {}), "turn": turn},
                 )
         except Exception:
             LOG.info(summary, extra={"meeting_id": self.meeting_id})
@@ -1307,6 +1311,7 @@ class RecallVoiceSession:
                             self.turn_first_audio_at = time.monotonic()
                             if self.turn_first_audio_event is not None:
                                 self.turn_first_audio_event.set()
+                            asyncio.create_task(self._report_runtime("healthy", {}, "The meeting agent started sending audio", "first_audio"))
                         await self._send_bytes(raw)
                         self.metrics.tts_audio_frames += 1
                         self.metrics.tts_audio_bytes += len(raw)
@@ -1440,6 +1445,8 @@ class RecallVoiceSession:
                             delta = normalize_voice_delta(str(event.get("text") or ""))
                             if not delta:
                                 continue
+                            if not received_delta:
+                                asyncio.create_task(self._report_runtime("healthy", {}, "The meeting agent started speaking", "agent_first_token"))
                             received_delta = True
                             full_text += delta
                             buffer += delta
@@ -1502,6 +1509,7 @@ class RecallVoiceSession:
             self.echo_guard.remember_output(buffer)
         await self._send_tts(buffer, flush=True)
         await asyncio.wait_for(self.tts_done_event.wait(), timeout=45.0)
+        asyncio.create_task(self._report_runtime("healthy", {}, "The meeting agent finished the spoken response", "final_audio"))
         response_ms = max(0, round((time.monotonic() - started) * 1000))
         if speculative:
             self.draft_result = (full_text, cost, response_ms)

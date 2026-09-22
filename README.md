@@ -232,6 +232,13 @@ parts of the live path; use real calls to evaluate end-to-end responsiveness
 because local audio-conversion tests do not measure Twilio, Deepgram, network,
 or model latency.
 
+Recall sessions report the same low-cardinality runtime stages back to Chusky:
+speech detected, eager and final transcript, agent first token, first audio,
+and final audio. The root meeting record stores only these stage names,
+sanitized summaries, and bounded timing samples. It never stores transcript
+content, meeting URLs, media frames, or provider payloads in the operator
+timeline.
+
 In the Twilio Console, set the purchased Twilio number's **A call comes in**
 webhook to `https://chusky.selithub.shop/twilio/inbound`, method `POST`. The
 route is deliberately private-first: it rejects any caller not listed in
