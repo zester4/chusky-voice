@@ -1858,7 +1858,13 @@ async def recall_audio(websocket: WebSocket) -> None:
                             if isinstance(payload.get("reason"), str):
                                 authorization_reason = payload["reason"][:320]
                     except (ValueError, TypeError):
+                        # Older/stale root deployments returned a plain 404
+                        # body. Do not mislabel that as a missing meeting;
+                        # give the participant a safe deployment diagnosis.
                         pass
+                    if response.status_code == 404 and not authorization_reason:
+                        authorization_code = "media_authorize_route_unavailable"
+                        authorization_reason = "Chusky's meeting service could not verify this session. Rejoin after the service finishes deploying."
                 return response.status_code
 
             # Recall webhooks and the provider's retrieve endpoint can briefly
