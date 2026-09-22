@@ -308,6 +308,13 @@ RECALL_TURN_START_BUDGET_MS=10000
 RECALL_TURN_FALLBACK_ENABLED=true
 ```
 
+The media-authorization endpoint is an authenticated internal service boundary.
+`200` authorizes the page, `425` means the Recall bot is still being admitted,
+and `404`/`410` means the owner-scoped meeting session is no longer available.
+Configuration failures return `503` with a safe diagnostic code; they are not
+treated as a missing meeting. The bridge logs only that code, never meeting
+IDs, credentials, or provider payloads.
+
 For meetings, the authenticated media-authorization response can provide that
 owner's selected Flux voice; it overrides `VOICE_TTS_MODEL` for the meeting
 session only. The Telegram `/home` voice menu changes the per-account choice,

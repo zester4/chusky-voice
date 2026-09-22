@@ -1780,12 +1780,13 @@ async def recall_audio(websocket: WebSocket) -> None:
         stage = "media_authorization"
         pending_notified = False
         authorization_reason = ""
+        authorization_code = ""
         authorized_meeting: tuple[MeetingMode, str] | None = None
         authorized_language: tuple[str, list[str], list[str]] = ("english", [], [])
         authorized_tts_model = settings.tts_model
         async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
             async def check_media_authorization() -> int:
-                nonlocal pending_notified, authorized_meeting, authorized_language, authorized_tts_model, authorization_reason
+                nonlocal pending_notified, authorized_meeting, authorized_language, authorized_tts_model, authorization_reason, authorization_code
                 response = await client.post(
                     settings.media_authorize_url,
                     headers={"Authorization": f"Bearer {settings.bridge_secret}"},
@@ -1802,13 +1803,16 @@ async def recall_audio(websocket: WebSocket) -> None:
                     pending_notified = True
                     recall_metrics.media_authorization_waits += 1
                     await websocket.send_json({"type": "status", "code": "meeting_not_ready"})
-                elif response.status_code in (404, 410):
+                elif response.status_code >= 400:
                     try:
                         payload = response.json()
-                        if isinstance(payload, dict) and isinstance(payload.get("reason"), str):
-                            authorization_reason = payload["reason"][:320]
+                        if isinstance(payload, dict):
+                            if isinstance(payload.get("code"), str):
+                                authorization_code = payload["code"][:80]
+                            if isinstance(payload.get("reason"), str):
+                                authorization_reason = payload["reason"][:320]
                     except (ValueError, TypeError):
-                        authorization_reason = "The meeting assistant has ended. If the call is still open, join Chusky again."
+                        pass
                 return response.status_code
 
             # Recall webhooks and the provider's retrieve endpoint can briefly
@@ -1823,7 +1827,10 @@ async def recall_audio(websocket: WebSocket) -> None:
                 await websocket.close(code=1013, reason="meeting_not_ready")
             elif authorization_status in (404, 410):
                 recall_metrics.media_authorization_rejections += 1
-                LOG.warning("Recall media authorization denied", extra={"stage": stage, "http_status": authorization_status})
+                LOG.warning(
+                    "Recall media authorization denied",
+                    extra={"stage": stage, "http_status": authorization_status, "reason_code": authorization_code or "meeting_unavailable"},
+                )
                 if authorization_reason:
                     await websocket.send_json({"type": "status", "code": "meeting_unavailable", "message": authorization_reason})
                 await websocket.close(code=1008, reason="meeting_unavailable")
@@ -1833,7 +1840,10 @@ async def recall_audio(websocket: WebSocket) -> None:
                 await websocket.close(code=1011, reason="bridge_auth_failed")
             else:
                 recall_metrics.media_authorization_rejections += 1
-                LOG.warning("Recall media authorization service rejected request", extra={"stage": stage, "http_status": authorization_status})
+                LOG.warning(
+                    "Recall media authorization service rejected request",
+                    extra={"stage": stage, "http_status": authorization_status, "reason_code": authorization_code or "authorization_failed"},
+                )
                 await websocket.close(code=1011, reason="media_authorization_failed")
             return
         if authorized_meeting is None:
