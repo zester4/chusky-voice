@@ -160,7 +160,7 @@
           if (event.code === 1008 || terminalBridgeFailure || reconnectAttempts >= 4) {
             let message = "Could not restore meeting audio. Rejoin the meeting to try again.";
             if (event.code === 1008 && event.reason === "invalid_ticket") message = "Secure meeting session could not be verified. Rejoin and check the shared bridge secret.";
-            else if (event.code === 1008 && event.reason === "meeting_unavailable") message = "This meeting is no longer active or could not be verified.";
+            else if (event.code === 1008 && event.reason === "meeting_unavailable") message = "Chusky could not confirm that this meeting is still live. If the call is open, rejoin Chusky after a moment; otherwise the meeting may have ended.";
             else if (event.code === 1011 && event.reason === "bridge_auth_failed") message = "Meeting bridge authentication failed. Check that both services use the same bridge secret.";
             else if (event.code === 1011 && event.reason === "media_authorization_failed") message = "Chusky could not verify the meeting with its main service. Check the service URL and logs.";
             else if (event.code === 1011 && event.reason === "voice_service_unavailable") message = "Meeting audio could not be initialized. Please ask the meeting host to rejoin Chusky.";
