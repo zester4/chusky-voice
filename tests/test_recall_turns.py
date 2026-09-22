@@ -8,6 +8,7 @@ from recall_turns import (
     default_meeting_greeting,
     flux_turn_time_bounds_ms,
     is_recall_invocation,
+    parse_meeting_language_authorization,
     parse_meeting_media_authorization,
     parse_meeting_tts_model,
 )
@@ -152,6 +153,24 @@ class MeetingConversationDefaultsTests(unittest.TestCase):
 
 
 class MeetingAuthorizationPresentationTests(unittest.TestCase):
+    def test_accepts_bounded_multilingual_hints_and_keyterms(self):
+        mode, hints, keyterms = parse_meeting_language_authorization({
+            "languageMode": "multilingual",
+            "languageHints": [" en ", "es"],
+            "keyterms": ["Chusky", "Recall Runtime"],
+        })
+        self.assertEqual(mode, "multilingual")
+        self.assertEqual(hints, ["en", "es"])
+        self.assertEqual(keyterms, ["Chusky", "Recall Runtime"])
+
+    def test_rejects_untrusted_language_configuration(self):
+        with self.assertRaises(ValueError):
+            parse_meeting_language_authorization({"languageMode": "fr", "languageHints": [], "keyterms": []})
+        with self.assertRaises(ValueError):
+            parse_meeting_language_authorization({"languageMode": "multilingual", "languageHints": ["en"] * 9, "keyterms": []})
+        with self.assertRaises(ValueError):
+            parse_meeting_language_authorization({"languageMode": "multilingual", "languageHints": [], "keyterms": []})
+
     def test_uses_authorized_company_greeting_and_proactive_mode(self):
         mode, greeting = parse_meeting_media_authorization(
             {

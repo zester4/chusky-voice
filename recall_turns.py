@@ -24,7 +24,7 @@ def parse_meeting_media_authorization(value: Any, fallback_mode: str) -> tuple[M
         fallback_mode = "addressed"
     if value is None:
         return fallback_mode, default_meeting_greeting(fallback_mode)
-    if not isinstance(value, dict) or not {"interactionMode", "greeting"}.issubset(value) or set(value) - {"interactionMode", "greeting", "ttsModel"}:
+    if not isinstance(value, dict) or not {"interactionMode", "greeting"}.issubset(value) or set(value) - {"interactionMode", "greeting", "ttsModel", "languageMode", "languageHints", "keyterms"}:
         raise ValueError("invalid meeting media authorization response")
     mode = value.get("interactionMode")
     greeting = value.get("greeting")
@@ -36,6 +36,27 @@ def parse_meeting_media_authorization(value: Any, fallback_mode: str) -> tuple[M
     if not greeting or len(greeting) > 500 or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", greeting):
         raise ValueError("invalid meeting greeting from authorization service")
     return mode, greeting
+
+
+def parse_meeting_language_authorization(value: Any) -> tuple[Literal["english", "multilingual"], list[str], list[str]]:
+    """Validate the owner-scoped language configuration without trusting provider payloads."""
+    if value is None:
+        return "english", [], []
+    if not isinstance(value, dict):
+        raise ValueError("invalid meeting language authorization response")
+    mode = value.get("languageMode", "english")
+    if mode not in ("english", "multilingual"):
+        raise ValueError("invalid meeting language mode from authorization service")
+    hints = value.get("languageHints", [])
+    keyterms = value.get("keyterms", [])
+    if not isinstance(hints, list) or len(hints) > 8 or any(not isinstance(item, str) or not item.strip() or len(item) > 40 for item in hints):
+        raise ValueError("invalid meeting language hints from authorization service")
+    if not isinstance(keyterms, list) or len(keyterms) > 50 or any(not isinstance(item, str) or not item.strip() or len(item) > 80 for item in keyterms):
+        raise ValueError("invalid meeting keyterms from authorization service")
+    normalized_hints = [item.strip() for item in hints]
+    if mode == "multilingual" and not normalized_hints:
+        raise ValueError("multilingual meeting authorization requires a language hint")
+    return mode, normalized_hints, [item.strip() for item in keyterms]
 
 
 def parse_meeting_tts_model(value: Any, fallback_model: str) -> str:

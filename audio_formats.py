@@ -70,17 +70,23 @@ def deepgram_flux_listen_url(
     eager_eot_threshold: float,
     eot_threshold: float,
     eot_timeout_ms: int,
+    *,
+    language_hints: list[str] | None = None,
 ) -> str:
-    query = urlencode(
-        {
-            "model": model,
-            "encoding": "linear16",
-            "sample_rate": DEEPGRAM_INPUT_SAMPLE_RATE,
-            "eager_eot_threshold": eager_eot_threshold,
-            "eot_threshold": eot_threshold,
-            "eot_timeout_ms": eot_timeout_ms,
-        }
-    )
+    query_values: dict[str, object] = {
+        "model": model,
+        "encoding": "linear16",
+        "sample_rate": DEEPGRAM_INPUT_SAMPLE_RATE,
+        "eager_eot_threshold": eager_eot_threshold,
+        "eot_threshold": eot_threshold,
+        "eot_timeout_ms": eot_timeout_ms,
+    }
+    if model == "flux-general-multi":
+        hints = [hint.strip() for hint in (language_hints or []) if isinstance(hint, str) and hint.strip()]
+        if not hints:
+            raise ValueError("flux-general-multi requires at least one language hint")
+        query_values["language_hint"] = hints
+    query = urlencode(query_values, doseq=True)
     return f"wss://api.deepgram.com/v2/listen?{query}"
 
 
