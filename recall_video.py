@@ -41,10 +41,24 @@ def valid_visual_handoff_url(value: str) -> bool:
         return False
 
 
-def visual_configuration_status(handoff_url: str, secret: str) -> str:
+def visual_configuration_issue(handoff_url: str, secret: str) -> str:
+    """Return a safe operator diagnosis without returning configuration values."""
     if not handoff_url and not secret:
         return "disabled"
-    return "configured" if valid_visual_handoff_url(handoff_url) and valid_recall_workspace_secret(secret) else "misconfigured"
+    if not handoff_url:
+        return "missing_handoff_url"
+    if not valid_visual_handoff_url(handoff_url):
+        return "invalid_handoff_url"
+    if not secret:
+        return "missing_workspace_secret"
+    if not valid_recall_workspace_secret(secret):
+        return "invalid_workspace_secret"
+    return "configured"
+
+
+def visual_configuration_status(handoff_url: str, secret: str) -> str:
+    issue = visual_configuration_issue(handoff_url, secret)
+    return "configured" if issue == "configured" else "disabled" if issue == "disabled" else "misconfigured"
 
 
 def _header(headers: Any, name: str) -> str | None:

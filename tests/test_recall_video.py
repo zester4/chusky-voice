@@ -3,7 +3,7 @@ import hashlib
 import hmac
 import unittest
 
-from recall_video import RecallScreenShareSampler, parse_screenshare_frame, valid_visual_handoff_url, verify_recall_websocket_signature, visual_configuration_status
+from recall_video import RecallScreenShareSampler, parse_screenshare_frame, valid_visual_handoff_url, verify_recall_websocket_signature, visual_configuration_issue, visual_configuration_status
 
 
 PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/WQAAAABJRU5ErkJggg=="
@@ -29,6 +29,9 @@ def signed_headers(secret=SECRET, message_id="msg_video_123", timestamp="1800000
 class RecallVideoTests(unittest.TestCase):
     def test_optional_visual_health_requires_valid_https_handoff_and_workspace_secret(self):
         self.assertEqual(visual_configuration_status("", ""), "disabled")
+        self.assertEqual(visual_configuration_issue("", ""), "disabled")
+        self.assertEqual(visual_configuration_issue("", SECRET), "missing_handoff_url")
+        self.assertEqual(visual_configuration_issue("https://chusky.example/frame", ""), "missing_workspace_secret")
         self.assertEqual(visual_configuration_status("https://chusky.example/internal/recall/visual-frame", SECRET), "configured")
         self.assertEqual(visual_configuration_status("http://chusky.example/frame", SECRET), "misconfigured")
         self.assertEqual(visual_configuration_status("https://chusky.example/frame?token=x", SECRET), "misconfigured")

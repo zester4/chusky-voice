@@ -366,6 +366,9 @@ Screen understanding is an optional per-meeting capability and requires the visu
 handoff URL and valid workspace verification secret on this voice service,
 plus participant-disclosure/chat readiness on the main service. Audio-only
 meetings continue to work when these optional visual settings are absent.
+When it is misconfigured, `optionalFeatures.sharedScreenConfigurationIssue`
+reports only a safe diagnosis such as `missing_handoff_url`,
+`missing_workspace_secret`, or `invalid_workspace_secret`.
 
 ### Opt-in meeting screen understanding
 

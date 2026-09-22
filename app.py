@@ -47,7 +47,7 @@ from latency import (
     turn_start_deadline_exceeded,
 )
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
-from recall_video import RecallScreenShareSampler, parse_screenshare_frame, valid_visual_handoff_url, verify_recall_websocket_signature, visual_configuration_status
+from recall_video import RecallScreenShareSampler, parse_screenshare_frame, valid_visual_handoff_url, verify_recall_websocket_signature, visual_configuration_issue, visual_configuration_status
 from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, build_meeting_outcome_payload, default_meeting_greeting, flux_turn_time_bounds_ms, is_recall_invocation, parse_meeting_language_authorization, parse_meeting_media_authorization, parse_meeting_tts_model
 from speech_text import normalize_voice_delta, normalize_voice_text
 from twilio_auth import valid_twilio_ticket, valid_twilio_websocket
@@ -1720,12 +1720,13 @@ async def recall_health() -> dict[str, Any]:
         settings = RecallSettings.from_env()
         media_authorization = await probe_recall_media_authorization(settings)
         status = "configured" if media_authorization == "configured" else "misconfigured" if media_authorization in {"bridge_auth_mismatch", "route_missing", "root_meetings_disabled"} else "degraded"
+        visual_status = visual_configuration_status(settings.visual_frame_url, settings.realtime_secret)
         return {
             "ok": status != "misconfigured",
             "provider": "recall",
             "status": status,
             "checks": {"mediaAuthorization": media_authorization},
-            "optionalFeatures": {"sharedScreenUnderstanding": visual_configuration_status(settings.visual_frame_url, settings.realtime_secret)},
+            "optionalFeatures": {"sharedScreenUnderstanding": visual_status, "sharedScreenConfigurationIssue": visual_configuration_issue(settings.visual_frame_url, settings.realtime_secret)},
             "metrics": recall_metrics.snapshot(len(recall_meetings.active)),
         }
     except RecallConfigurationError as exc:
