@@ -16,6 +16,9 @@
     #status { margin-top: 12px; padding: 8px 13px; border-radius: 999px; background: #252b37; color: #c6d0e3; font-size: 13px; }
     #status[data-state="ready"] { color: #8ce4b0; }
     #status[data-state="error"] { color: #ffaaa4; }
+    #caption { display: none; width: min(100%, 620px); min-height: 2.2em; margin-top: 4px; padding: 9px 14px; border: 1px solid #ffffff18; border-radius: 12px; background: #0b0d12cc; color: #f6f7f9; font-size: 15px; text-align: left; }
+    #caption[data-visible="true"] { display: block; }
+    #caption .speaker { color: #f4c45f; font-weight: 650; }
   </style>
 </head>
 <body>
@@ -24,10 +27,14 @@
     <h1>Chusky</h1>
     <div class="role">Digital assistant</div>
     <div id="status" role="status" aria-live="polite" data-state="connecting">Connecting securely…</div>
+    <div id="caption" role="log" aria-live="polite" data-visible="false"><span class="speaker"></span><span class="caption-text"></span></div>
   </main>
   <script>
     (() => {
       const status = document.getElementById("status");
+      const caption = document.getElementById("caption");
+      const captionSpeaker = caption.querySelector(".speaker");
+      const captionText = caption.querySelector(".caption-text");
       const setStatus = (state, message) => { status.dataset.state = state; status.textContent = message; };
       const params = new URLSearchParams(location.hash.slice(1));
       const ticket = params.get("session");
@@ -122,6 +129,7 @@
               if (activeSocket !== socket || activeSocket.readyState !== WebSocket.OPEN) return;
               activeSocket.send(JSON.stringify({ type: "ready", sampleRate: context.sampleRate }));
               reconnectAttempts = 0;
+              caption.dataset.visible = message.liveCaptions === true ? "true" : "false";
               const modeLabel = message.interactionMode === "addressed"
                 ? "Connected · say ‘Chusky’ to speak"
                 : "Connected · joining the conversation";
@@ -140,6 +148,12 @@
               ? message.message.trim().slice(0, 320)
               : "Meeting audio is unavailable. If the call is still open, join Chusky again.";
             setStatus("error", meetingUnavailableMessage);
+          } else if (message.type === "caption" && message.text && message.speaker) {
+            captionSpeaker.textContent = `${String(message.speaker).slice(0, 40)}: `;
+            captionText.textContent = String(message.text).slice(0, 500);
+            caption.dataset.visible = "true";
+          } else if (message.type === "language" && message.language) {
+            setStatus("ready", `Connected · language detected: ${String(message.language).slice(0, 40)}`);
           } else if (message.type === "error") {
             setStatus("error", "Meeting audio could not be started. Check the voice service configuration.");
           }

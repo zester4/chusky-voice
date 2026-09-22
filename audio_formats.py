@@ -83,9 +83,11 @@ def deepgram_flux_listen_url(
     }
     if model == "flux-general-multi":
         hints = [hint.strip() for hint in (language_hints or []) if isinstance(hint, str) and hint.strip()]
-        if not hints:
-            raise ValueError("flux-general-multi requires at least one language hint")
-        query_values["language_hint"] = hints
+        # Flux Multilingual auto-detects when no hints are supplied. When
+        # hints exist they bias the expected languages without disabling the
+        # provider's dynamic language detection.
+        if hints:
+            query_values["language_hint"] = hints
     query = urlencode(query_values, doseq=True)
     return f"wss://api.deepgram.com/v2/listen?{query}"
 

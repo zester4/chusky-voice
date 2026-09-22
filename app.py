@@ -48,7 +48,7 @@ from latency import (
 )
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
 from recall_video import RecallScreenShareSampler, parse_screenshare_frame, valid_visual_handoff_url, verify_recall_websocket_signature, visual_configuration_issue, visual_configuration_status
-from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, build_meeting_outcome_payload, default_meeting_greeting, flux_turn_time_bounds_ms, is_recall_invocation, parse_meeting_language_authorization, parse_meeting_media_authorization, parse_meeting_tts_model
+from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, build_meeting_outcome_payload, default_meeting_greeting, flux_turn_time_bounds_ms, is_recall_invocation, parse_meeting_language_authorization, parse_meeting_live_captions, parse_meeting_media_authorization, parse_meeting_tts_model
 from speech_text import normalize_voice_delta, normalize_voice_text
 from twilio_auth import valid_twilio_ticket, valid_twilio_websocket
 
@@ -837,6 +837,9 @@ class RecallVoiceSession:
         self.language_mode = claims.get("languageMode", "english") if claims.get("languageMode") in ("english", "multilingual") else "english"
         self.language_hints = [item for item in claims.get("languageHints", []) if isinstance(item, str)][:8]
         self.keyterms = [item for item in claims.get("keyterms", []) if isinstance(item, str)][:50]
+        self.live_captions = claims.get("liveCaptions") is True
+        self.auto_detect_language = self.language_mode == "multilingual" and not self.language_hints
+        self.detected_language: str | None = None
         self.stt_model = "flux-general-multi" if self.language_mode == "multilingual" else settings.stt_model
         self.audio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
         self.context = MeetingContextWindow()
@@ -909,7 +912,7 @@ class RecallVoiceSession:
                         }
                         if self.stt_model.startswith("flux-"):
                             await stt.send(json.dumps({"type": "Configure", "language_hints": self.language_hints, "keyterms": self.keyterms}))
-                        await self._send_text({"type": "ready", "sampleRate": DEEPGRAM_INPUT_SAMPLE_RATE, "interactionMode": self.interaction_mode, "languageMode": self.language_mode})
+                        await self._send_text({"type": "ready", "sampleRate": DEEPGRAM_INPUT_SAMPLE_RATE, "interactionMode": self.interaction_mode, "languageMode": self.language_mode, "liveCaptions": self.live_captions})
                         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                         self.stop.set()
                         for task in pending:
@@ -1043,6 +1046,39 @@ class RecallVoiceSession:
                     self.stt_audio_started_at = time.time()
                 await self.stt_socket.send(frame)
 
+    async def _send_caption(self, text: str, *, final: bool, speaker: str = "Participant") -> None:
+        """Stream bounded captions to the trusted meeting surface only.
+
+        Captions are deliberately not sent to the Chusky API, context window,
+        logs, or outcome transcript. They disappear with the media session.
+        """
+        if not self.live_captions:
+            return
+        cleaned = normalize_voice_text(text)[:500]
+        if not cleaned:
+            return
+        try:
+            await self._send_text({"type": "caption", "speaker": speaker[:40], "text": cleaned, "final": final})
+        except Exception:
+            LOG.info("Recall live caption delivery stopped", extra={"meeting_id": self.meeting_id})
+
+    async def _update_detected_language(self, event: dict[str, Any]) -> None:
+        """Lock Flux to a detected language, then follow deliberate switches."""
+        if not self.auto_detect_language or self.stt_socket is None:
+            return
+        languages = event.get("languages")
+        if not isinstance(languages, list) or not languages or not isinstance(languages[0], str):
+            return
+        language = languages[0].strip()[:40]
+        if not re.fullmatch(r"[A-Za-z]{2,8}(?:-[A-Za-z0-9]{2,8})?", language) or language == self.detected_language:
+            return
+        try:
+            await self.stt_socket.send(json.dumps({"type": "Configure", "language_hints": [language]}))
+            self.detected_language = language
+            await self._send_text({"type": "language", "language": language})
+        except Exception:
+            LOG.info("Recall language reconfiguration could not be sent", extra={"meeting_id": self.meeting_id})
+
     async def _receive_stt(self) -> None:
         if self.stt_socket is None:
             return
@@ -1075,6 +1111,8 @@ class RecallVoiceSession:
                 except (TypeError, ValueError, OverflowError):
                     pass
                 if transcript and not bool(event.get("is_final")):
+                    if not self.echo_guard.is_echo(transcript):
+                        await self._send_caption(transcript, final=False)
                     # Nova emits SpeechStarted without transcript content. Use
                     # interim text to interrupt only a real participant, not
                     # Chusky's own echoed Output Media.
@@ -1082,6 +1120,8 @@ class RecallVoiceSession:
                         await self._interrupt()
                     continue
                 if transcript and bool(event.get("is_final")):
+                    if not self.echo_guard.is_echo(transcript):
+                        await self._send_caption(transcript, final=False)
                     if not self.nova_final_segments or self.nova_final_segments[-1] != transcript:
                         self.nova_final_segments.append(transcript)
                 if bool(event.get("speech_final")):
@@ -1095,6 +1135,7 @@ class RecallVoiceSession:
                     self.nova_final_words.clear()
                     self.nova_final_audio_start = self.nova_final_audio_end = None
                     if final_transcript:
+                        await self._send_caption(final_transcript, final=True)
                         await self._handle_final_stt_turn(final_transcript, *(timing or (None, None)))
                 continue
             if event.get("type") == "UtteranceEnd" and self.stt_model == "nova-3":
@@ -1110,12 +1151,15 @@ class RecallVoiceSession:
                 self.nova_final_words.clear()
                 self.nova_final_audio_start = self.nova_final_audio_end = None
                 if final_transcript:
+                    await self._send_caption(final_transcript, final=True)
                     await self._handle_final_stt_turn(final_transcript, *(timing or (None, None)))
                 continue
             if event.get("type") != "TurnInfo":
                 continue
             turn_event = str(event.get("event") or "")
             transcript = normalize_voice_text(str(event.get("transcript") or ""))[:5000]
+            if self.stt_model == "flux-general-multi":
+                await self._update_detected_language(event)
             try:
                 provider_turn_index = int(event.get("turn_index") or 0)
             except (TypeError, ValueError):
@@ -1128,6 +1172,8 @@ class RecallVoiceSession:
                 # Chusky cannot interrupt itself through the meeting mix.
                 if self.echo_guard.is_echo(transcript):
                     self.metrics.turns_suppressed += 1
+                elif transcript:
+                    await self._send_caption(transcript, final=False)
                 elif is_recall_invocation(transcript):
                     if turn_event == "StartOfTurn":
                         asyncio.create_task(self._report_runtime("healthy", {}, "A participant started an addressed turn", "speech_detected"))
@@ -1135,6 +1181,7 @@ class RecallVoiceSession:
                 if turn_event == "TurnResumed" and provider_turn_index:
                     self.eager_end_times.pop(provider_turn_index, None)
             elif turn_event == "EndOfTurn" and transcript:
+                await self._send_caption(transcript, final=True)
                 timing = flux_turn_time_bounds_ms(self.stt_audio_started_at, event)
                 if provider_turn_index:
                     self.eager_end_times.pop(provider_turn_index, None)
@@ -1145,6 +1192,7 @@ class RecallVoiceSession:
                         self.finalized_turn_indexes = set(sorted(self.finalized_turn_indexes)[-32:])
                 await self._handle_flux_end_turn(transcript, provider_turn_index, *(timing or (None, None)))
             elif turn_event == "EagerEndOfTurn" and transcript and provider_turn_index:
+                await self._send_caption(transcript, final=False)
                 if len(self.eager_end_times) >= 8:
                     self.eager_end_times.pop(next(iter(self.eager_end_times)))
                 self.eager_end_times[provider_turn_index] = time.monotonic()
@@ -1837,10 +1885,11 @@ async def recall_audio(websocket: WebSocket) -> None:
         authorization_code = ""
         authorized_meeting: tuple[MeetingMode, str] | None = None
         authorized_language: tuple[str, list[str], list[str]] = ("english", [], [])
+        authorized_live_captions = False
         authorized_tts_model = settings.tts_model
         async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
             async def check_media_authorization() -> int:
-                nonlocal pending_notified, authorized_meeting, authorized_language, authorized_tts_model, authorization_reason, authorization_code
+                nonlocal pending_notified, authorized_meeting, authorized_language, authorized_live_captions, authorized_tts_model, authorization_reason, authorization_code
                 response = await client.post(
                     settings.media_authorize_url,
                     headers={"Authorization": f"Bearer {settings.bridge_secret}"},
@@ -1852,6 +1901,7 @@ async def recall_audio(websocket: WebSocket) -> None:
                         authorization_payload, str(claims.get("interactionMode", "addressed")),
                     )
                     authorized_language = parse_meeting_language_authorization(authorization_payload)
+                    authorized_live_captions = parse_meeting_live_captions(authorization_payload)
                     authorized_tts_model = parse_meeting_tts_model(authorization_payload, settings.tts_model)
                 if response.status_code == 425 and not pending_notified:
                     pending_notified = True
@@ -1910,6 +1960,7 @@ async def recall_audio(websocket: WebSocket) -> None:
             authorized_meeting = parse_meeting_media_authorization(None, str(claims.get("interactionMode", "addressed")))
         claims["interactionMode"] = authorized_meeting[0]
         claims["languageMode"], claims["languageHints"], claims["keyterms"] = authorized_language
+        claims["liveCaptions"] = authorized_live_captions
         greeting = authorized_meeting[1]
         if auth.get("reconnect") is True:
             try:

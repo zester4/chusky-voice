@@ -74,13 +74,13 @@ class TwilioAudioFormatTests(unittest.TestCase):
         self.assertEqual(recall_query["encoding"], ["linear16"])
         self.assertEqual(recall_query["sample_rate"], ["48000"])
 
-    def test_multilingual_flux_connection_includes_required_language_hints(self):
+    def test_multilingual_flux_connection_supports_hints_and_auto_detection(self):
         url = deepgram_flux_listen_url("flux-general-multi", 0.45, 0.65, 800, language_hints=["en", "es"])
         query = parse_qs(urlparse(url).query)
         self.assertEqual(query["model"], ["flux-general-multi"])
         self.assertEqual(query["language_hint"], ["en", "es"])
-        with self.assertRaises(ValueError):
-            deepgram_flux_listen_url("flux-general-multi", 0.45, 0.65, 800)
+        auto_url = deepgram_flux_listen_url("flux-general-multi", 0.45, 0.65, 800)
+        assert "language_hint" not in parse_qs(urlparse(auto_url).query)
 
     def test_twilio_flux_speak_contract_uses_native_mulaw(self):
         url = twilio_deepgram_speak_url("flux-haley-en")

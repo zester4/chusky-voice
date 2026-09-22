@@ -24,7 +24,7 @@ def parse_meeting_media_authorization(value: Any, fallback_mode: str) -> tuple[M
         fallback_mode = "addressed"
     if value is None:
         return fallback_mode, default_meeting_greeting(fallback_mode)
-    if not isinstance(value, dict) or not {"interactionMode", "greeting"}.issubset(value) or set(value) - {"interactionMode", "greeting", "ttsModel", "languageMode", "languageHints", "keyterms"}:
+    if not isinstance(value, dict) or not {"interactionMode", "greeting"}.issubset(value) or set(value) - {"interactionMode", "greeting", "ttsModel", "languageMode", "languageHints", "keyterms", "liveCaptions"}:
         raise ValueError("invalid meeting media authorization response")
     mode = value.get("interactionMode")
     greeting = value.get("greeting")
@@ -36,6 +36,15 @@ def parse_meeting_media_authorization(value: Any, fallback_mode: str) -> tuple[M
     if not greeting or len(greeting) > 500 or re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", greeting):
         raise ValueError("invalid meeting greeting from authorization service")
     return mode, greeting
+
+
+def parse_meeting_live_captions(value: Any) -> bool:
+    """Read the explicit, ephemeral caption grant from the owner-scoped API."""
+    if value is None:
+        return False
+    if not isinstance(value, dict) or not isinstance(value.get("liveCaptions", False), bool):
+        raise ValueError("invalid live caption authorization response")
+    return value.get("liveCaptions", False) is True
 
 
 def parse_meeting_language_authorization(value: Any) -> tuple[Literal["english", "multilingual"], list[str], list[str]]:
@@ -54,8 +63,8 @@ def parse_meeting_language_authorization(value: Any) -> tuple[Literal["english",
     if not isinstance(keyterms, list) or len(keyterms) > 50 or any(not isinstance(item, str) or not item.strip() or len(item) > 80 for item in keyterms):
         raise ValueError("invalid meeting keyterms from authorization service")
     normalized_hints = [item.strip() for item in hints]
-    if mode == "multilingual" and not normalized_hints:
-        raise ValueError("multilingual meeting authorization requires a language hint")
+    # An empty list deliberately means provider auto-detection. A non-empty
+    # list biases Flux toward the owner's expected languages.
     return mode, normalized_hints, [item.strip() for item in keyterms]
 
 

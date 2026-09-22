@@ -9,6 +9,7 @@ from recall_turns import (
     flux_turn_time_bounds_ms,
     is_recall_invocation,
     parse_meeting_language_authorization,
+    parse_meeting_live_captions,
     parse_meeting_media_authorization,
     parse_meeting_tts_model,
 )
@@ -168,8 +169,14 @@ class MeetingAuthorizationPresentationTests(unittest.TestCase):
             parse_meeting_language_authorization({"languageMode": "fr", "languageHints": [], "keyterms": []})
         with self.assertRaises(ValueError):
             parse_meeting_language_authorization({"languageMode": "multilingual", "languageHints": ["en"] * 9, "keyterms": []})
+        mode, hints, keyterms = parse_meeting_language_authorization({"languageMode": "multilingual", "languageHints": [], "keyterms": []})
+        self.assertEqual((mode, hints, keyterms), ("multilingual", [], []))
+
+    def test_live_captions_require_an_explicit_boolean_grant(self):
+        self.assertTrue(parse_meeting_live_captions({"liveCaptions": True}))
+        self.assertFalse(parse_meeting_live_captions({"liveCaptions": False}))
         with self.assertRaises(ValueError):
-            parse_meeting_language_authorization({"languageMode": "multilingual", "languageHints": [], "keyterms": []})
+            parse_meeting_live_captions({"liveCaptions": "yes"})
 
     def test_uses_authorized_company_greeting_and_proactive_mode(self):
         mode, greeting = parse_meeting_media_authorization(

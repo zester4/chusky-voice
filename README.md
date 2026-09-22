@@ -234,8 +234,11 @@ or model latency.
 
 Recall sessions report the same low-cardinality runtime stages back to Chusky:
 speech detected, eager and final transcript, agent first token, first audio,
-and final audio. The root meeting record stores only these stage names,
-sanitized summaries, and bounded timing samples. It never stores transcript
+and final audio. Multilingual Flux sessions may auto-detect a language and
+reconfigure language hints between turns. An explicit live-caption grant sends
+bounded speaker-labelled captions only to the authenticated meeting page; they
+are discarded when the session ends. The root meeting record stores only these
+stage names, sanitized summaries, and bounded timing samples. It never stores transcript
 content, meeting URLs, media frames, or provider payloads in the operator
 timeline.
 
