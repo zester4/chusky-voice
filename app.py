@@ -48,7 +48,7 @@ from latency import (
 )
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
 from recall_video import RecallScreenShareSampler, parse_screenshare_frame, valid_visual_handoff_url, verify_recall_websocket_signature, visual_configuration_status
-from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, build_meeting_outcome_payload, default_meeting_greeting, flux_turn_time_bounds_ms, is_recall_invocation, parse_meeting_media_authorization, parse_meeting_tts_model
+from recall_turns import CopilotTurnGate, MeetingContextWindow, MeetingEchoGuard, MeetingMode, build_meeting_outcome_payload, default_meeting_greeting, flux_turn_time_bounds_ms, is_recall_invocation, parse_meeting_language_authorization, parse_meeting_media_authorization, parse_meeting_tts_model
 from speech_text import normalize_voice_delta, normalize_voice_text
 from twilio_auth import valid_twilio_ticket, valid_twilio_websocket
 
@@ -152,10 +152,11 @@ class RecallSettings:
                 invalid_fields.append(field_name)
         if invalid_fields:
             raise RecallConfigurationError("required_settings_invalid", tuple(invalid_fields))
-        # Meetings use Nova-3 independently from Twilio's Flux STT path.
+        # Meeting STT is independently configurable from Twilio. Multilingual
+        # meetings select Flux multi from the authenticated meeting profile.
         stt = os.getenv("RECALL_STT_MODEL", "nova-3").strip()
         tts = os.getenv("VOICE_TTS_MODEL", "flux-haley-en").strip()
-        if stt not in {"nova-3", "flux-general-en"} or not tts.startswith("flux-"):
+        if stt not in {"nova-3", "flux-general-en", "flux-general-multi"} or not tts.startswith("flux-"):
             raise RecallConfigurationError("meeting_models_invalid", ("RECALL_STT_MODEL", "VOICE_TTS_MODEL"))
         return cls(
             secret, deepgram, turn_url, commit_url, authorize_url, visual_frame_url, realtime_secret, stt,
@@ -831,6 +832,10 @@ class RecallVoiceSession:
         if self.interaction_mode not in ("addressed", "copilot", "representative"):
             raise RuntimeError("Recall meeting interaction mode is invalid")
         self.greeting = greeting or default_meeting_greeting(self.interaction_mode)
+        self.language_mode = claims.get("languageMode", "english") if claims.get("languageMode") in ("english", "multilingual") else "english"
+        self.language_hints = [item for item in claims.get("languageHints", []) if isinstance(item, str)][:8]
+        self.keyterms = [item for item in claims.get("keyterms", []) if isinstance(item, str)][:50]
+        self.stt_model = "flux-general-multi" if self.language_mode == "multilingual" else settings.stt_model
         self.audio: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
         self.context = MeetingContextWindow()
         self.echo_guard = MeetingEchoGuard()
@@ -843,7 +848,14 @@ class RecallVoiceSession:
         self.tts_done_event: asyncio.Event | None = None
         self.turn_first_audio_event: asyncio.Event | None = None
         self.tts_first_audio_recorded = False
+        self.turn_first_audio_at: float | None = None
         self.response_task: asyncio.Task[None] | None = None
+        self.draft_task: asyncio.Task[None] | None = None
+        self.draft_transcript = ""
+        self.draft_turn_index: int | None = None
+        self.draft_result: tuple[str, float, int] | None = None
+        self.eager_end_times: dict[int, float] = {}
+        self.finalized_turn_indexes: set[int] = set()
         self.response_started_at = 0.0
         self.interrupted = False
         self.turn_index = 0
@@ -864,18 +876,19 @@ class RecallVoiceSession:
     async def run(self) -> None:
         if not re.fullmatch(r"flux-[a-z]+-en", self.tts_model):
             raise RuntimeError("Recall voice requires a Flux streaming TTS model")
-        if self.settings.stt_model == "nova-3":
+        if self.stt_model == "nova-3":
             stt_url = deepgram_nova_listen_url(
-                self.settings.stt_model,
+                self.stt_model,
                 self.settings.nova_endpointing_ms,
                 self.settings.nova_utterance_end_ms,
             )
         else:
             stt_url = deepgram_flux_listen_url(
-                self.settings.stt_model,
+                self.stt_model,
                 self.settings.stt_eager_eot_threshold,
                 self.settings.stt_eot_threshold,
                 self.settings.stt_eot_timeout_ms,
+                language_hints=self.language_hints,
             )
         tts_url = deepgram_flux_speak_url(self.tts_model)
         tasks: set[asyncio.Task[Any]] = set()
@@ -892,7 +905,9 @@ class RecallVoiceSession:
                             asyncio.create_task(self._receive_tts(), name=f"recall-tts-recv-{self.meeting_id}"),
                             asyncio.create_task(asyncio.sleep(self.settings.max_meeting_seconds), name=f"recall-timeout-{self.meeting_id}"),
                         }
-                        await self._send_text({"type": "ready", "sampleRate": DEEPGRAM_INPUT_SAMPLE_RATE, "interactionMode": self.interaction_mode})
+                        if self.stt_model.startswith("flux-"):
+                            await stt.send(json.dumps({"type": "Configure", "language_hints": self.language_hints, "keyterms": self.keyterms}))
+                        await self._send_text({"type": "ready", "sampleRate": DEEPGRAM_INPUT_SAMPLE_RATE, "interactionMode": self.interaction_mode, "languageMode": self.language_mode})
                         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                         self.stop.set()
                         for task in pending:
@@ -909,7 +924,9 @@ class RecallVoiceSession:
                 await asyncio.gather(*tasks, return_exceptions=True)
                 if self.response_task and not self.response_task.done():
                     self.response_task.cancel()
-                    await asyncio.gather(self.response_task, return_exceptions=True)
+                if self.draft_task and not self.draft_task.done():
+                    self.draft_task.cancel()
+                await asyncio.gather(*(task for task in (self.response_task, self.draft_task) if task), return_exceptions=True)
                 await self._commit_outcome_transcript()
                 for socket in (self.stt_socket, self.tts_socket):
                     if socket is not None:
@@ -976,6 +993,13 @@ class RecallVoiceSession:
                     continue
                 if control.get("type") == "stop":
                     return
+                if control.get("type") == "force_end_turn":
+                    if self.stt_socket is not None and self.stt_model.startswith("flux-"):
+                        try:
+                            await self.stt_socket.send(json.dumps({"type": "ForceEndTurn"}))
+                        except Exception:
+                            LOG.info("Recall force-end-turn could not be sent", extra={"meeting_id": self.meeting_id})
+                    continue
                 if control.get("type") == "ready":
                     try:
                         sample_rate = int(control.get("sampleRate", 0))
@@ -1027,7 +1051,7 @@ class RecallVoiceSession:
                 event = json.loads(raw)
             except json.JSONDecodeError:
                 continue
-            if event.get("type") == "Results" and self.settings.stt_model == "nova-3":
+            if event.get("type") == "Results" and self.stt_model == "nova-3":
                 channel = event.get("channel")
                 alternatives = channel.get("alternatives") if isinstance(channel, dict) else None
                 alternative = alternatives[0] if isinstance(alternatives, list) and alternatives and isinstance(alternatives[0], dict) else {}
@@ -1071,7 +1095,7 @@ class RecallVoiceSession:
                     if final_transcript:
                         await self._handle_final_stt_turn(final_transcript, *(timing or (None, None)))
                 continue
-            if event.get("type") == "UtteranceEnd" and self.settings.stt_model == "nova-3":
+            if event.get("type") == "UtteranceEnd" and self.stt_model == "nova-3":
                 # UtteranceEnd is a server-side gap-detection fallback for
                 # noisy meetings where audio VAD cannot produce speech_final.
                 final_transcript = normalize_voice_text(" ".join(self.nova_final_segments))[:5000]
@@ -1090,6 +1114,10 @@ class RecallVoiceSession:
                 continue
             turn_event = str(event.get("event") or "")
             transcript = normalize_voice_text(str(event.get("transcript") or ""))[:5000]
+            try:
+                provider_turn_index = int(event.get("turn_index") or 0)
+            except (TypeError, ValueError):
+                provider_turn_index = 0
             if turn_event in {"StartOfTurn", "TurnResumed"}:
                 # Ordinary participants talking should neither burn model/TTS
                 # budget nor cut off Chusky. Barge in only when the wake word
@@ -1100,9 +1128,81 @@ class RecallVoiceSession:
                     self.metrics.turns_suppressed += 1
                 elif is_recall_invocation(transcript):
                     await self._interrupt()
+                if turn_event == "TurnResumed" and provider_turn_index:
+                    self.eager_end_times.pop(provider_turn_index, None)
             elif turn_event == "EndOfTurn" and transcript:
                 timing = flux_turn_time_bounds_ms(self.stt_audio_started_at, event)
-                await self._handle_final_stt_turn(transcript, *(timing or (None, None)))
+                if provider_turn_index:
+                    self.eager_end_times.pop(provider_turn_index, None)
+                    if provider_turn_index in self.finalized_turn_indexes:
+                        continue
+                    self.finalized_turn_indexes.add(provider_turn_index)
+                    if len(self.finalized_turn_indexes) > 64:
+                        self.finalized_turn_indexes = set(sorted(self.finalized_turn_indexes)[-32:])
+                await self._handle_flux_end_turn(transcript, provider_turn_index, *(timing or (None, None)))
+            elif turn_event == "EagerEndOfTurn" and transcript and provider_turn_index:
+                if len(self.eager_end_times) >= 8:
+                    self.eager_end_times.pop(next(iter(self.eager_end_times)))
+                self.eager_end_times[provider_turn_index] = time.monotonic()
+                # Keep speculative work conservative: only an explicit
+                # invocation may start a draft. Final turns still use the
+                # normal copilot/representative cadence.
+                if is_recall_invocation(transcript) and not self.echo_guard.is_echo(transcript):
+                    await self._start_draft(transcript, provider_turn_index)
+
+    async def _start_draft(self, transcript: str, provider_turn_index: int) -> None:
+        if self.draft_task and not self.draft_task.done():
+            if self.draft_turn_index == provider_turn_index and self._same_transcript(self.draft_transcript, transcript):
+                return
+            await self._interrupt()
+        elif self.response_task and not self.response_task.done():
+            await self._interrupt()
+        self.draft_transcript = transcript
+        self.draft_turn_index = provider_turn_index
+        self.draft_result = None
+        context = self.context.snapshot()
+        self.draft_task = asyncio.create_task(
+            self._respond(transcript, self.turn_index + 1, context, None, None, None, speculative=True),
+            name=f"recall-draft-{self.meeting_id}-{provider_turn_index}",
+        )
+        self.draft_task.add_done_callback(self._observe_response)
+
+    @staticmethod
+    def _same_transcript(left: str, right: str) -> bool:
+        normalize = lambda value: " ".join("".join(char.lower() if char.isalnum() or char.isspace() else " " for char in value).split())
+        return normalize(left) == normalize(right)
+
+    async def _handle_flux_end_turn(self, transcript: str, provider_turn_index: int, turn_started_at_ms: int | None = None, turn_ended_at_ms: int | None = None) -> None:
+        matching_draft = bool(self.draft_task and self.draft_turn_index == provider_turn_index and self._same_transcript(self.draft_transcript, transcript))
+        if matching_draft and self.draft_task:
+            await asyncio.gather(self.draft_task, return_exceptions=True)
+            result = self.draft_result
+            if result and result[0]:
+                self.turn_index += 1
+                await self._commit_draft(transcript, result[0], result[1], self.turn_index, result[2])
+                self._clear_draft()
+                return
+        if self.draft_task and not self.draft_task.done():
+            await self._interrupt()
+        self._clear_draft()
+        await self._handle_final_stt_turn(transcript, turn_started_at_ms, turn_ended_at_ms)
+
+    def _clear_draft(self) -> None:
+        self.draft_task = None
+        self.draft_transcript = ""
+        self.draft_turn_index = None
+        self.draft_result = None
+
+    async def _commit_draft(self, transcript: str, text: str, cost: float, turn_id: int, response_ms: int) -> None:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
+            response = await client.post(
+                self.settings.commit_turn_url,
+                headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                json={"meetingId": self.meeting_id, "userId": self.user_id, "transcript": transcript, "text": text, "cost": cost, "turnId": f"flux-{turn_id}", "speak": True, "runtimeState": "healthy", "turn": {"completed": True, "eager": True, "finalResponseMs": response_ms}},
+            )
+            response.raise_for_status()
+        self.context.add("participant", transcript)
+        self.context.add("chusky", text)
 
     async def _handle_final_stt_turn(self, transcript: str, turn_started_at_ms: int | None = None, turn_ended_at_ms: int | None = None) -> None:
         """Send one completed Flux or Nova utterance through the same policy."""
@@ -1157,10 +1257,22 @@ class RecallVoiceSession:
                 exc_type, status_hint, f" code={failure_code}" if failure_code else "",
                 extra={"meeting_id": self.meeting_id, "stage": "agent_response", "error_type": exc_type, **({"failure_code": failure_code} if failure_code else {})},
             )
+            asyncio.create_task(self._report_runtime("degraded", {"failed": True, "errorCode": failure_code or "agent_run_failed"}, "Meeting response entered a degraded state"))
+
+    async def _report_runtime(self, state: str, turn: dict[str, Any], summary: str) -> None:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+                await client.post(
+                    self.settings.commit_turn_url,
+                    headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                    json={"meetingId": self.meeting_id, "userId": self.user_id, "turnId": f"runtime-{self.turn_index}-{int(time.time() * 1000)}", "speak": False, "runtimeState": state, "turn": turn},
+                )
+        except Exception:
+            LOG.info(summary, extra={"meeting_id": self.meeting_id})
 
     async def _interrupt(self) -> None:
-        active = self.response_task
-        if not active or active.done():
+        active_tasks = [task for task in (self.response_task, self.draft_task) if task and not task.done()]
+        if not active_tasks:
             return
         self.interrupted = True
         if self.tts_socket is not None:
@@ -1173,10 +1285,13 @@ class RecallVoiceSession:
             await self._send_text({"type": "clear"})
         except Exception:
             pass
-        active.cancel()
-        await asyncio.gather(active, return_exceptions=True)
-        if self.response_task is active:
+        for task in active_tasks:
+            task.cancel()
+        await asyncio.gather(*active_tasks, return_exceptions=True)
+        if self.response_task in active_tasks:
             self.response_task = None
+        if self.draft_task in active_tasks:
+            self._clear_draft()
 
     async def _receive_tts(self) -> None:
         if self.tts_socket is None:
@@ -1187,6 +1302,7 @@ class RecallVoiceSession:
                     if not self.interrupted and not self.stop.is_set():
                         if not self.tts_first_audio_recorded:
                             self.tts_first_audio_recorded = True
+                            self.turn_first_audio_at = time.monotonic()
                             if self.turn_first_audio_event is not None:
                                 self.turn_first_audio_event.set()
                         await self._send_bytes(raw)
@@ -1235,6 +1351,15 @@ class RecallVoiceSession:
         self.metrics.turn_fallbacks += 1
         self.response_started_at = time.monotonic()
         await self._speak(turn_fallback_text(self.metrics.turn_fallbacks - 1))
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+                await client.post(
+                    self.settings.commit_turn_url,
+                    headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
+                    json={"meetingId": self.meeting_id, "userId": self.user_id, "turnId": f"flux-fallback-{self.turn_index}", "speak": False, "runtimeState": "degraded", "turn": {"fallback": True, "completed": True}},
+                )
+        except Exception:
+            LOG.info("Recall fallback runtime state could not be persisted", extra={"meeting_id": self.meeting_id})
 
     async def _respond(
         self,
@@ -1244,6 +1369,7 @@ class RecallVoiceSession:
         context_turn_id: int | None,
         turn_started_at_ms: int | None,
         turn_ended_at_ms: int | None,
+        speculative: bool = False,
     ) -> None:
         if self.tts_socket is None:
             LOG.warning("Recall meeting response skipped: TTS socket unavailable", extra={"meeting_id": self.meeting_id})
@@ -1257,9 +1383,10 @@ class RecallVoiceSession:
         received_delta = False
         started = time.monotonic()
         budget_ms = getattr(self.settings, "turn_start_budget_ms", 10_000)
-        budget_started_at: float | None = started if speaking else None
+        budget_started_at: float | None = started if speaking and not speculative else None
         self.turn_first_audio_event = asyncio.Event()
         self.tts_first_audio_recorded = False
+        self.turn_first_audio_at = None
         async with httpx.AsyncClient(timeout=httpx.Timeout(65.0, connect=8.0)) as client:
             try:
                 async with client.stream(
@@ -1285,7 +1412,7 @@ class RecallVoiceSession:
                     lines = response.aiter_lines().__aiter__()
                     while True:
                         try:
-                            if budget_started_at is not None and not self.tts_first_audio_recorded and getattr(self.settings, "turn_fallback_enabled", True):
+                            if not speculative and budget_started_at is not None and not self.tts_first_audio_recorded and getattr(self.settings, "turn_fallback_enabled", True):
                                 remaining = max(0.001, float(max(1, int(budget_ms))) / 1000 - (time.monotonic() - budget_started_at))
                                 if turn_start_deadline_exceeded(budget_started_at, time.monotonic(), budget_ms, self.tts_first_audio_recorded, self.interrupted):
                                     raise asyncio.TimeoutError
@@ -1295,7 +1422,7 @@ class RecallVoiceSession:
                         except StopAsyncIteration:
                             break
                         except asyncio.TimeoutError:
-                            if not self.interrupted and not self.tts_first_audio_recorded and getattr(self.settings, "turn_fallback_enabled", True):
+                            if not speculative and not self.interrupted and not self.tts_first_audio_recorded and getattr(self.settings, "turn_fallback_enabled", True):
                                 self.metrics.turn_start_budget_exceeded += 1
                                 await self._speak_slow_turn_fallback()
                                 return
@@ -1357,12 +1484,15 @@ class RecallVoiceSession:
         if not received_done:
             return
         if not full_text:
+            if speculative:
+                self.draft_result = ("", cost, max(0, round((time.monotonic() - started) * 1000)))
+                return
             if self.interaction_mode in ("copilot", "representative"):
                 async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
                     response = await client.post(
                         self.settings.commit_turn_url,
                         headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
-                        json={"meetingId": self.meeting_id, "userId": self.user_id, "cost": cost, "turnId": f"flux-{turn_id}", "speak": False},
+                        json={"meetingId": self.meeting_id, "userId": self.user_id, "cost": cost, "turnId": f"flux-{turn_id}", "speak": False, "runtimeState": "healthy", "turn": {"completed": True}},
                     )
                     response.raise_for_status()
             return
@@ -1370,11 +1500,15 @@ class RecallVoiceSession:
             self.echo_guard.remember_output(buffer)
         await self._send_tts(buffer, flush=True)
         await asyncio.wait_for(self.tts_done_event.wait(), timeout=45.0)
+        response_ms = max(0, round((time.monotonic() - started) * 1000))
+        if speculative:
+            self.draft_result = (full_text, cost, response_ms)
+            return
         async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=5.0)) as client:
             response = await client.post(
                 self.settings.commit_turn_url,
                 headers={"Authorization": f"Bearer {self.settings.bridge_secret}"},
-                json={"meetingId": self.meeting_id, "userId": self.user_id, "transcript": transcript, "text": full_text, "cost": cost, "turnId": f"flux-{turn_id}", "speak": True},
+                json={"meetingId": self.meeting_id, "userId": self.user_id, "transcript": transcript, "text": full_text, "cost": cost, "turnId": f"flux-{turn_id}", "speak": True, "runtimeState": "healthy", "turn": {"completed": True, **({"firstAudioMs": max(0, round((self.turn_first_audio_at - started) * 1000))} if self.turn_first_audio_at else {}), "finalResponseMs": response_ms}},
             )
             response.raise_for_status()
         self.context.add("chusky", full_text)
@@ -1646,10 +1780,11 @@ async def recall_audio(websocket: WebSocket) -> None:
         stage = "media_authorization"
         pending_notified = False
         authorized_meeting: tuple[MeetingMode, str] | None = None
+        authorized_language: tuple[str, list[str], list[str]] = ("english", [], [])
         authorized_tts_model = settings.tts_model
         async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
             async def check_media_authorization() -> int:
-                nonlocal pending_notified, authorized_meeting, authorized_tts_model
+                nonlocal pending_notified, authorized_meeting, authorized_language, authorized_tts_model
                 response = await client.post(
                     settings.media_authorize_url,
                     headers={"Authorization": f"Bearer {settings.bridge_secret}"},
@@ -1660,6 +1795,7 @@ async def recall_audio(websocket: WebSocket) -> None:
                     authorized_meeting = parse_meeting_media_authorization(
                         authorization_payload, str(claims.get("interactionMode", "addressed")),
                     )
+                    authorized_language = parse_meeting_language_authorization(authorization_payload)
                     authorized_tts_model = parse_meeting_tts_model(authorization_payload, settings.tts_model)
                 if response.status_code == 425 and not pending_notified:
                     pending_notified = True
@@ -1689,7 +1825,25 @@ async def recall_audio(websocket: WebSocket) -> None:
         if authorized_meeting is None:
             authorized_meeting = parse_meeting_media_authorization(None, str(claims.get("interactionMode", "addressed")))
         claims["interactionMode"] = authorized_meeting[0]
+        claims["languageMode"], claims["languageHints"], claims["keyterms"] = authorized_language
         greeting = authorized_meeting[1]
+        if auth.get("reconnect") is True:
+            try:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+                    response = await client.post(
+                        settings.commit_turn_url,
+                        headers={"Authorization": f"Bearer {settings.bridge_secret}"},
+                        json={
+                            "meetingId": claims["meetingId"],
+                            "userId": claims["userId"],
+                            "turnId": f"reconnect-{uuid.uuid4().hex[:24]}",
+                            "speak": False,
+                            "runtimeState": "reconnecting",
+                        },
+                    )
+                    response.raise_for_status()
+            except Exception:
+                LOG.info("Recall reconnect state could not be persisted", extra={"meeting_id": claims["meetingId"]})
         stage = "meeting_capacity"
         if not await recall_meetings.reserve(claims["meetingId"], settings.max_active_meetings):
             await websocket.close(code=1013)
