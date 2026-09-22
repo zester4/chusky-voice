@@ -299,7 +299,9 @@ CHUSKY_RECALL_TURN_STREAM_URL=https://<chusky-host>/internal/recall/turn-stream
 CHUSKY_RECALL_COMMIT_TURN_URL=https://<chusky-host>/internal/recall/commit-turn
 CHUSKY_RECALL_MEDIA_AUTHORIZE_URL=https://<chusky-host>/internal/recall/media-authorize
 # Optional; required only for meetings explicitly opted into shared-screen vision.
-RECALL_REALTIME_SECRET=<same Recall workspace verification secret as Chusky root>
+RECALL_WORKSPACE_VERIFICATION_SECRET=<same Recall workspace verification secret as Chusky root>
+# Historical alias accepted by older deployments:
+# RECALL_REALTIME_SECRET=<same value>
 CHUSKY_RECALL_VISUAL_FRAME_URL=https://<chusky-host>/internal/recall/visual-frame
 RECALL_MAX_MEETING_SECONDS=7200
 RECALL_MAX_ACTIVE_MEETINGS=4
@@ -348,7 +350,8 @@ secret for both. The root service sends the AI/audio disclosure in supported
 meeting chats and handles `/chusky` commands; this voice service does not need
 the workspace secret for audio-only meetings. Shared-screen understanding
 uses that same workspace secret on this service to verify Recall's video
-websocket upgrade; it must match root's `RECALL_REALTIME_SECRET`. The same
+websocket upgrade; it must match the root service's
+`RECALL_WORKSPACE_VERIFICATION_SECRET` (or its historical alias). The same
 signed endpoint receives Recall's
 `speech_on`/`speech_off` participant transitions. The voice bridge correlates
 those short-lived transitions with Deepgram word timestamps and uses a name
