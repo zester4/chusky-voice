@@ -15,11 +15,17 @@ MAX_FRAME_BYTES = 1_500_000
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
+def _decode_recall_base64(value: str) -> bytes:
+    """Decode Recall's standard base64 values with optional ``=`` padding."""
+    padded = value + "=" * (-len(value) % 4)
+    return base64.b64decode(padded, validate=True)
+
+
 def valid_recall_workspace_secret(secret: str) -> bool:
     if not isinstance(secret, str) or not secret.startswith("whsec_") or len(secret) > 512:
         return False
     try:
-        return len(base64.b64decode(secret[6:], validate=True)) >= 16
+        return len(_decode_recall_base64(secret[6:])) >= 16
     except (ValueError, TypeError):
         return False
 
@@ -93,14 +99,14 @@ def verify_recall_websocket_signature(
         now = int(time.time()) if now_seconds is None else now_seconds
         if abs(now - timestamp_seconds) > tolerance_seconds:
             return False
-        key = base64.b64decode(secret[6:], validate=True)
+        key = _decode_recall_base64(secret[6:])
         expected = hmac.new(key, f"{message_id}.{timestamp}.".encode(), hashlib.sha256).digest()
         for item in signatures.split():
             version, separator, encoded = item.partition(",")
             if version != "v1" or not separator:
                 continue
             try:
-                if hmac.compare_digest(base64.b64decode(encoded, validate=True), expected):
+                if hmac.compare_digest(_decode_recall_base64(encoded), expected):
                     return True
             except (ValueError, TypeError):
                 continue

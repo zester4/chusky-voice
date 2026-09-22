@@ -8,6 +8,7 @@ from recall_video import RecallScreenShareSampler, parse_screenshare_frame, vali
 
 PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/WQAAAABJRU5ErkJggg=="
 SECRET = "whsec_" + base64.b64encode(b"workspace-secret-for-tests-32-bytes").decode()
+UNPADDED_SECRET = SECRET.rstrip("=")
 
 
 def event(frame=PNG, media_type="screenshare"):
@@ -33,6 +34,7 @@ class RecallVideoTests(unittest.TestCase):
         self.assertEqual(visual_configuration_issue("", SECRET), "missing_handoff_url")
         self.assertEqual(visual_configuration_issue("https://chusky.example/frame", ""), "missing_workspace_secret")
         self.assertEqual(visual_configuration_status("https://chusky.example/internal/recall/visual-frame", SECRET), "configured")
+        self.assertEqual(visual_configuration_status("https://chusky.example/internal/recall/visual-frame", UNPADDED_SECRET), "configured")
         self.assertEqual(visual_configuration_status("http://chusky.example/frame", SECRET), "misconfigured")
         self.assertEqual(visual_configuration_status("https://chusky.example/frame?token=x", SECRET), "misconfigured")
         self.assertEqual(visual_configuration_status("https://chusky.example/frame", "whsec_invalid"), "misconfigured")
@@ -41,6 +43,7 @@ class RecallVideoTests(unittest.TestCase):
     def test_verifies_recall_websocket_upgrade_with_empty_payload_and_fresh_timestamp(self):
         headers = signed_headers()
         self.assertTrue(verify_recall_websocket_signature(SECRET, headers, now_seconds=1_800_000_000))
+        self.assertTrue(verify_recall_websocket_signature(UNPADDED_SECRET, headers, now_seconds=1_800_000_000))
         self.assertFalse(verify_recall_websocket_signature(SECRET, headers, now_seconds=1_800_000_400))
         wrong_secret = "whsec_" + base64.b64encode(b"another-wrong-key-for-signing-32bytes").decode()
         self.assertFalse(verify_recall_websocket_signature(SECRET, signed_headers(secret=wrong_secret), now_seconds=1_800_000_000))
