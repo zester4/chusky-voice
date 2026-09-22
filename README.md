@@ -355,8 +355,14 @@ only when the timing and live roster identify one participant unambiguously;
 otherwise it responds without guessing. This does not enable Recall transcript
 generation, transcript webhooks, or post-meeting transcript artifacts.
 
-The main service's `/recall/health` reports Recall audio availability; screen
-understanding is an optional per-meeting capability and requires the visual
+The main service's `/recall/health` reports Recall audio availability and
+probes the authenticated root media-authorization route. The
+`checks.mediaAuthorization` value is `configured` when the route accepts the
+bridge secret, `route_missing` for a stale or incorrectly deployed root
+service, `bridge_auth_mismatch` when the shared secret differs, and
+`root_meetings_disabled` when the root service has meetings disabled. These
+diagnostics never include the URL, secret, meeting ID, or provider payload.
+Screen understanding is an optional per-meeting capability and requires the visual
 handoff URL and valid workspace verification secret on this voice service,
 plus participant-disclosure/chat readiness on the main service. Audio-only
 meetings continue to work when these optional visual settings are absent.

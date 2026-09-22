@@ -1656,6 +1656,46 @@ recall_meetings = RecallMeetingManager()
 recall_metrics = RecallMetrics()
 recall_handshakes = asyncio.Semaphore(32)
 metrics = BridgeMetrics()
+_recall_probe_lock = asyncio.Lock()
+_recall_probe_cache: tuple[float, str] | None = None
+
+
+async def probe_recall_media_authorization(settings: RecallSettings) -> str:
+    """Verify the root media route without exposing secrets or meeting data."""
+    global _recall_probe_cache
+    now = time.monotonic()
+    if _recall_probe_cache and now - _recall_probe_cache[0] < 30:
+        return _recall_probe_cache[1]
+    async with _recall_probe_lock:
+        now = time.monotonic()
+        if _recall_probe_cache and now - _recall_probe_cache[0] < 30:
+            return _recall_probe_cache[1]
+        try:
+            # An empty payload deliberately reaches validation. A 400 means
+            # the route and bridge secret are live; 404 means a stale or
+            # incorrectly deployed root service; 401 means secret drift.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=2.0)) as client:
+                response = await client.post(
+                    settings.media_authorize_url,
+                    headers={"Authorization": f"Bearer {settings.bridge_secret}"},
+                    json={},
+                )
+            if response.status_code == 400:
+                result = "configured"
+            elif response.status_code == 401:
+                result = "bridge_auth_mismatch"
+            elif response.status_code == 404:
+                result = "route_missing"
+            elif response.status_code == 503:
+                result = "root_meetings_disabled"
+            elif response.status_code in (408, 425, 429) or response.status_code >= 500:
+                result = "upstream_unavailable"
+            else:
+                result = f"http_{response.status_code}"
+        except (httpx.HTTPError, OSError, asyncio.TimeoutError):
+            result = "unreachable"
+        _recall_probe_cache = (time.monotonic(), result)
+        return result
 
 
 def authenticate(authorization: str | None, settings: Settings) -> None:
@@ -1678,10 +1718,13 @@ async def health() -> dict[str, Any]:
 async def recall_health() -> dict[str, Any]:
     try:
         settings = RecallSettings.from_env()
+        media_authorization = await probe_recall_media_authorization(settings)
+        status = "configured" if media_authorization == "configured" else "misconfigured" if media_authorization in {"bridge_auth_mismatch", "route_missing", "root_meetings_disabled"} else "degraded"
         return {
-            "ok": True,
+            "ok": status != "misconfigured",
             "provider": "recall",
-            "status": "configured",
+            "status": status,
+            "checks": {"mediaAuthorization": media_authorization},
             "optionalFeatures": {"sharedScreenUnderstanding": visual_configuration_status(settings.visual_frame_url, settings.realtime_secret)},
             "metrics": recall_metrics.snapshot(len(recall_meetings.active)),
         }
