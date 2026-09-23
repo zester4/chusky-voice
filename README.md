@@ -142,7 +142,7 @@ TWILIO_VOICE_ENABLED=true
 TWILIO_ACCOUNT_SID=AC...
 TWILIO_AUTH_TOKEN=...
 TWILIO_CALLER_ID=+<Twilio-verified caller ID>
-TWILIO_WEBHOOK_BASE_URL=https://chusky.selithub.shop
+TWILIO_WEBHOOK_BASE_URL=https://chusky.up.railway.app
 TWILIO_MEDIA_STREAM_URL=wss://voice.selithub.shop/twilio/stream
 TWILIO_INBOUND_ENABLED=true
 TWILIO_INBOUND_OWNER_USER_ID=<your Telegram numeric user ID>
@@ -243,7 +243,7 @@ content, meeting URLs, media frames, or provider payloads in the operator
 timeline.
 
 In the Twilio Console, set the purchased Twilio number's **A call comes in**
-webhook to `https://chusky.selithub.shop/twilio/inbound`, method `POST`. The
+webhook to `https://chusky.up.railway.app/twilio/inbound`, method `POST`. The
 route is deliberately private-first: it rejects any caller not listed in
 `TWILIO_INBOUND_ALLOWED_CALLERS`. It maps approved calls to the configured
 Telegram owner, so only that owner's Chusky memory is available during the
