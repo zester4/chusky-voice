@@ -1165,19 +1165,17 @@ class RecallVoiceSession:
             except (TypeError, ValueError):
                 provider_turn_index = 0
             if turn_event in {"StartOfTurn", "TurnResumed"}:
-                # Ordinary participants talking should neither burn model/TTS
-                # budget nor cut off Chusky. Barge in only when the wake word
-                # is actually present in the current recognized turn. Ignore
-                # provisional transcripts matching recently streamed TTS so
-                # Chusky cannot interrupt itself through the meeting mix.
+                # Ignore provisional transcripts matching recently streamed
+                # TTS. Proactive modes yield as soon as a real participant
+                # starts speaking; addressed mode waits for its wake word.
                 if self.echo_guard.is_echo(transcript):
                     self.metrics.turns_suppressed += 1
                 elif transcript:
                     await self._send_caption(transcript, final=False)
-                elif is_recall_invocation(transcript):
-                    if turn_event == "StartOfTurn":
-                        asyncio.create_task(self._report_runtime("healthy", {}, "A participant started an addressed turn", "speech_detected"))
-                    await self._interrupt()
+                    if self.interaction_mode in ("copilot", "representative") or is_recall_invocation(transcript):
+                        if self.interaction_mode == "addressed" and turn_event == "StartOfTurn":
+                            asyncio.create_task(self._report_runtime("healthy", {}, "A participant started an addressed turn", "speech_detected"))
+                        await self._interrupt()
                 if turn_event == "TurnResumed" and provider_turn_index:
                     self.eager_end_times.pop(provider_turn_index, None)
             elif turn_event == "EndOfTurn" and transcript:

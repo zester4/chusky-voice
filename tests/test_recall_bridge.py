@@ -1,9 +1,13 @@
 import base64
+import asyncio
 import hashlib
 import hmac
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
+import app as voice_app
 from recall_auth import valid_recall_ticket, wait_for_media_authorization
 
 
@@ -107,6 +111,75 @@ class RecallMediaAuthorizationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(status, 425)
         self.assertEqual(calls, 4)
+
+
+class RecallMeetingBargeInTests(unittest.IsolatedAsyncioTestCase):
+    async def test_addressed_mode_still_interrupts_for_a_wake_word(self):
+        class WebSocket:
+            async def send_text(self, _message):
+                pass
+
+        class Events:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if getattr(self, "sent", False):
+                    raise StopAsyncIteration
+                self.sent = True
+                return json.dumps({"type": "TurnInfo", "event": "StartOfTurn", "turn_index": 1, "transcript": "Hey Chusky, I have a question."})
+
+        session = voice_app.RecallVoiceSession(
+            {"meetingId": "mtg_addressed", "userId": 42, "interactionMode": "addressed"},
+            WebSocket(),
+            SimpleNamespace(tts_model="flux-hannah-en", stt_model="flux-general-en", copilot_min_interval_seconds=0),
+            voice_app.RecallMetrics(),
+            play_intro=False,
+        )
+        session.response_task = asyncio.create_task(asyncio.Event().wait())
+        session.stt_socket = Events()
+        interrupt = AsyncMock()
+        with patch.object(session, "_interrupt", interrupt):
+            await session._receive_stt()
+        self.assertEqual(interrupt.await_count, 1)
+        session.response_task.cancel()
+        await asyncio.gather(session.response_task, return_exceptions=True)
+
+    async def test_proactive_modes_yield_to_recognized_participant_speech_but_addressed_mode_does_not(self):
+        class WebSocket:
+            async def send_text(self, _message):
+                pass
+
+        class Events:
+            def __init__(self):
+                self.items = iter([json.dumps({"type": "TurnInfo", "event": "StartOfTurn", "turn_index": 1, "transcript": "Wait, I have a question."})])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        for mode in ("copilot", "representative", "addressed"):
+            session = voice_app.RecallVoiceSession(
+                {"meetingId": "mtg_yield", "userId": 42, "interactionMode": mode},
+                WebSocket(),
+                SimpleNamespace(tts_model="flux-hannah-en", stt_model="flux-general-en", copilot_min_interval_seconds=0),
+                voice_app.RecallMetrics(),
+                play_intro=False,
+            )
+            session.response_task = asyncio.create_task(asyncio.Event().wait())
+            session.tts_first_audio_recorded = True
+            session.stt_socket = Events()
+            interrupt = AsyncMock()
+            with patch.object(session, "_interrupt", interrupt):
+                await session._receive_stt()
+            self.assertEqual(interrupt.await_count, 1 if mode in ("copilot", "representative") else 0)
+            session.response_task.cancel()
+            await asyncio.gather(session.response_task, return_exceptions=True)
 
 
 if __name__ == "__main__":
