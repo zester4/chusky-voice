@@ -1532,7 +1532,35 @@ class RecallVoiceSession:
                                 full_text = fallback_text
                                 buffer = fallback_text
                         elif event.get("type") == "error":
-                            raise RecallMeetingAgentError(event.get("code"))
+                            failure_code = event.get("code")
+                            if failure_code not in RecallMeetingAgentError.ALLOWED_CODES:
+                                failure_code = "agent_run_failed"
+                            should_speak_recovery = (
+                                not speculative
+                                and not self.interrupted
+                                and (speaking or is_recall_invocation(transcript))
+                            )
+                            if not should_speak_recovery:
+                                raise RecallMeetingAgentError(failure_code)
+                            self.metrics.agent_failures += 1
+                            LOG.warning(
+                                "Recall meeting agent run failed; speaking recovery prompt",
+                                extra={"meeting_id": self.meeting_id, "stage": "agent_run", "failure_code": failure_code},
+                            )
+                            try:
+                                await self._speak_agent_failure_fallback()
+                            except Exception as fallback_error:
+                                LOG.warning(
+                                    "Recall meeting recovery prompt could not be spoken: %s",
+                                    type(fallback_error).__name__,
+                                    extra={"meeting_id": self.meeting_id, "stage": "agent_fallback"},
+                                )
+                            asyncio.create_task(self._report_runtime(
+                                "degraded",
+                                {"failed": True, "errorCode": failure_code},
+                                "Meeting response failed; recovery prompt was attempted",
+                            ))
+                            return
             finally:
                 self.turn_first_audio_event = None
         full_text = normalize_voice_text(full_text)[:5000]
@@ -1569,6 +1597,20 @@ class RecallVoiceSession:
             response.raise_for_status()
         self.context.add("chusky", full_text)
         _elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    async def _speak_agent_failure_fallback(self) -> None:
+        """Replace silent agent failures with a brief, honest spoken recovery."""
+        try:
+            if self.tts_socket is not None:
+                async with self.tts_lock:
+                    await self.tts_socket.send(json.dumps({"type": "Interrupt"}))
+            await self._send_text({"type": "clear"})
+        except Exception:
+            # A failed clear/interrupt must not prevent trying the recovery
+            # utterance; TTS itself will report if the stream is unavailable.
+            pass
+        self.interrupted = False
+        await self._speak("I’m having trouble responding right now. Please ask me again in a moment.")
 
 
 class RecallMeetingManager:

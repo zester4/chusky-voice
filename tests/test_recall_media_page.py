@@ -1,6 +1,7 @@
 import os
+import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import app as voice_app
 
@@ -15,6 +16,25 @@ class RecallMediaPageTests(unittest.IsolatedAsyncioTestCase):
         error = voice_app.RecallMeetingAgentError("participant transcript or secret")
         self.assertEqual(error.failure_code, "agent_run_failed")
         self.assertNotIn("participant transcript", str(error))
+
+    async def test_agent_failure_fallback_interrupts_stale_output_and_speaks_a_clear_recovery(self):
+        session = voice_app.RecallVoiceSession.__new__(voice_app.RecallVoiceSession)
+        session.tts_socket = type("Socket", (), {"send": AsyncMock()})()
+        session.tts_lock = asyncio.Lock()
+        session.interrupted = True
+        send_text = AsyncMock()
+        speak = AsyncMock()
+        with patch.object(voice_app.RecallVoiceSession, "_send_text", send_text), patch.object(
+            voice_app.RecallVoiceSession, "_speak", speak
+        ):
+            await session._speak_agent_failure_fallback()
+
+        session.tts_socket.send.assert_awaited_once_with('{"type": "Interrupt"}')
+        send_text.assert_awaited_once_with({"type": "clear"})
+        speak.assert_awaited_once_with(
+            "I’m having trouble responding right now. Please ask me again in a moment."
+        )
+        self.assertFalse(session.interrupted)
 
     async def test_media_page_is_served_even_when_audio_configuration_is_missing(self):
         with patch.object(
