@@ -181,6 +181,116 @@ class RecallMeetingBargeInTests(unittest.IsolatedAsyncioTestCase):
             session.response_task.cancel()
             await asyncio.gather(session.response_task, return_exceptions=True)
 
+    async def test_flux_eager_event_does_not_start_a_speculative_agent_run(self):
+        class WebSocket:
+            async def send_text(self, _message):
+                pass
+
+        class Events:
+            def __init__(self):
+                self.items = iter([
+                    json.dumps({"type": "TurnInfo", "event": "EagerEndOfTurn", "turn_index": 1, "transcript": "Hey Chusky, check this."}),
+                    json.dumps({"type": "TurnInfo", "event": "EndOfTurn", "turn_index": 1, "transcript": "Hey Chusky, check this."}),
+                ])
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                try:
+                    return next(self.items)
+                except StopIteration:
+                    raise StopAsyncIteration
+
+        session = voice_app.RecallVoiceSession(
+            {"meetingId": "mtg_eager", "userId": 42, "interactionMode": "addressed"},
+            WebSocket(),
+            SimpleNamespace(tts_model="flux-hannah-en", stt_model="flux-general-en", copilot_min_interval_seconds=0),
+            voice_app.RecallMetrics(),
+            play_intro=False,
+        )
+        session.stt_socket = Events()
+        final_turn = AsyncMock()
+        with patch.object(session, "_handle_final_stt_turn", final_turn):
+            await session._receive_stt()
+        self.assertEqual(final_turn.await_count, 1)
+        self.assertEqual(final_turn.await_args.args[0], "Hey Chusky, check this.")
+        self.assertFalse(hasattr(session, "draft_task"))
+
+    async def test_recall_sends_first_tts_chunk_before_long_delta_stream_finishes(self):
+        class WebSocket:
+            async def send_text(self, _message):
+                pass
+
+        session = voice_app.RecallVoiceSession(
+            {"meetingId": "mtg_first_audio", "userId": 42, "interactionMode": "addressed"},
+            WebSocket(),
+            SimpleNamespace(
+                bridge_secret="b" * 32,
+                stt_model="flux-general-en",
+                tts_model="flux-haley-en",
+                copilot_min_interval_seconds=4,
+                turn_stream_url="https://chusky.test/turn",
+                commit_turn_url="https://chusky.test/commit",
+                turn_start_budget_ms=10000,
+                turn_fallback_enabled=True,
+            ),
+            voice_app.RecallMetrics(),
+            play_intro=False,
+        )
+        session.tts_socket = object()
+        sent = []
+
+        async def send_tts(text="", flush=False):
+            sent.append((text, flush))
+            if flush:
+                session.tts_done_event.set()
+
+        class Response:
+            status_code = 200
+
+            def raise_for_status(self):
+                return None
+
+            async def aiter_lines(self):
+                yield json.dumps({"type": "speak"})
+                yield json.dumps({"type": "delta", "text": "I can help you with that today and explain"})
+                # The stream is still open after this delta. TTS must already
+                # have received a bounded first phrase before more model output.
+                assert any(text and not flush for text, flush in sent)
+                yield json.dumps({"type": "delta", "text": " the next step."})
+                yield json.dumps({"type": "done", "speak": True, "text": "I can help you with that today and explain the next step."})
+
+        class Stream:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return None
+
+        class Client:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            def stream(self, *_args, **_kwargs):
+                return Stream()
+
+            async def post(self, *_args, **_kwargs):
+                return SimpleNamespace(raise_for_status=lambda: None)
+
+        with patch.object(voice_app.httpx, "AsyncClient", Client), patch.object(session, "_send_tts", send_tts):
+            await session._respond("Hey Chusky, help me.", 1, [], None, None, None)
+
+        self.assertTrue(sent[0][0])
+        self.assertFalse(sent[0][1])
+        self.assertTrue(sent[-1][1])
+
 
 if __name__ == "__main__":
     unittest.main()

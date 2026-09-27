@@ -67,7 +67,7 @@ def deepgram_linear16_to_twilio_mulaw(
 
 def deepgram_flux_listen_url(
     model: str,
-    eager_eot_threshold: float,
+    eager_eot_threshold: float | None,
     eot_threshold: float,
     eot_timeout_ms: int,
     *,
@@ -77,10 +77,11 @@ def deepgram_flux_listen_url(
         "model": model,
         "encoding": "linear16",
         "sample_rate": DEEPGRAM_INPUT_SAMPLE_RATE,
-        "eager_eot_threshold": eager_eot_threshold,
         "eot_threshold": eot_threshold,
         "eot_timeout_ms": eot_timeout_ms,
     }
+    if eager_eot_threshold is not None:
+        query_values["eager_eot_threshold"] = eager_eot_threshold
     if model == "flux-general-multi":
         hints = [hint.strip() for hint in (language_hints or []) if isinstance(hint, str) and hint.strip()]
         # Flux Multilingual auto-detects when no hints are supplied. When

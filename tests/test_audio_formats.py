@@ -74,6 +74,11 @@ class TwilioAudioFormatTests(unittest.TestCase):
         self.assertEqual(recall_query["encoding"], ["linear16"])
         self.assertEqual(recall_query["sample_rate"], ["48000"])
 
+        recall_confirmed_url = deepgram_flux_listen_url("flux-general-en", None, 0.65, 800)
+        recall_confirmed_query = parse_qs(urlparse(recall_confirmed_url).query)
+        self.assertNotIn("eager_eot_threshold", recall_confirmed_query)
+        self.assertEqual(recall_confirmed_query["eot_timeout_ms"], ["800"])
+
     def test_multilingual_flux_connection_supports_hints_and_auto_detection(self):
         url = deepgram_flux_listen_url("flux-general-multi", 0.45, 0.65, 800, language_hints=["en", "es"])
         query = parse_qs(urlparse(url).query)

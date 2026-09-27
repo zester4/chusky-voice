@@ -14,17 +14,13 @@ only the exact owner-granted connected-app actions and native reminder/task
 tools. It does not receive private memory or arbitrary Composio tools. Neither
 transport persists raw audio in this bridge.
 
-Recall meetings use Deepgram **Nova-3** for live transcription and retain
-Deepgram Flux TTS for streamed speech. Nova-3 runs on Listen v1 with VAD,
-interim results, 500 ms endpointing, and a 1,000 ms utterance-end fallback.
-The bridge assembles finalized segments before asking Chusky to respond. This
-is independent of the Flux STT configuration used for Twilio telephone calls.
-
-Recall meetings use Deepgram **Nova-3** for live transcription and retain
-Deepgram Flux TTS for streamed speech. Nova-3 runs on Listen v1 with VAD,
-interim results, 500 ms endpointing, and a 1,000 ms utterance-end fallback.
-The bridge assembles finalized segments before asking Chusky to respond. This
-is independent of the Flux STT configuration used for Twilio telephone calls.
+Recall meetings use Deepgram **Flux** conversational STT and Flux TTS by
+default. Flux's confirmed end-of-turn event drives agent turns; the Recall path
+does not launch speculative agent runs, so an unfinished draft cannot block
+the final turn or perform an action twice. Set `RECALL_STT_MODEL=nova-3` as a
+temporary rollback; Nova-3 uses Listen v1 with VAD, 500 ms endpointing, and a
+1,000 ms utterance-end fallback. This meeting setting is independent of the
+Flux STT configuration used for Twilio telephone calls.
 
 It also accepts a separate **Twilio bidirectional Media Stream** at
 `/twilio/stream`. Twilio's wire format remains base64 `audio/x-mulaw` at 8 kHz.
@@ -303,6 +299,7 @@ intact:
 RECALL_MEETINGS_ENABLED=true
 RECALL_MEDIA_BRIDGE_SECRET=<same value as Chusky root>
 DEEPGRAM_API_KEY=<Deepgram server API key>
+RECALL_STT_MODEL=flux-general-en
 VOICE_STT_MODEL=flux-general-en
 VOICE_TTS_MODEL=flux-haley-en
 CHUSKY_RECALL_TURN_STREAM_URL=https://<chusky-host>/internal/recall/turn-stream

@@ -16,7 +16,6 @@ def settings() -> voice_app.RecallSettings:
         visual_frame_url="",
         realtime_secret="",
         stt_model="nova-3",
-        stt_eager_eot_threshold=0.45,
         stt_eot_threshold=0.65,
         stt_eot_timeout_ms=800,
         nova_endpointing_ms=500,
@@ -83,6 +82,20 @@ class RecallHealthTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, env, clear=False):
             resolved = voice_app.RecallSettings.from_env()
         self.assertEqual(resolved.realtime_secret, workspace_secret)
+
+    def test_meeting_stt_defaults_to_flux_and_keeps_nova_as_explicit_rollback(self):
+        env = {
+            "RECALL_MEETINGS_ENABLED": "true",
+            "RECALL_MEDIA_BRIDGE_SECRET": "b" * 32,
+            "DEEPGRAM_API_KEY": "deepgram-test",
+            "CHUSKY_RECALL_TURN_STREAM_URL": "https://chusky.test/turn",
+            "CHUSKY_RECALL_COMMIT_TURN_URL": "https://chusky.test/commit",
+            "CHUSKY_RECALL_MEDIA_AUTHORIZE_URL": "https://chusky.test/authorize",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(voice_app.RecallSettings.from_env().stt_model, "flux-general-en")
+        with patch.dict(os.environ, {**env, "RECALL_STT_MODEL": "nova-3"}, clear=True):
+            self.assertEqual(voice_app.RecallSettings.from_env().stt_model, "nova-3")
 
 
 if __name__ == "__main__":
