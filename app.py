@@ -39,6 +39,16 @@ from audio_formats import (
     twilio_deepgram_speak_url,
     twilio_mulaw_to_deepgram_linear16,
 )
+from elevenlabs_tts import (
+    ElevenLabsConfigurationError,
+    close_context as elevenlabs_close_context,
+    flush as elevenlabs_flush,
+    parse_audio_event as parse_elevenlabs_audio_event,
+    speak as elevenlabs_speak,
+    start_context as elevenlabs_start_context,
+    stream_url as elevenlabs_stream_url,
+    validate_configuration as validate_elevenlabs_configuration,
+)
 from latency import (
     latency_summary,
     resolve_speculative_draft,
@@ -70,6 +80,10 @@ class Settings:
     stt_eot_threshold: float
     stt_eot_timeout_ms: int
     tts_model: str
+    elevenlabs_enabled: bool
+    elevenlabs_api_key: str
+    elevenlabs_voice_id: str
+    elevenlabs_model_id: str
     twilio_native_mulaw: bool
     barge_in_min_chars: int
     greeting: str
@@ -84,6 +98,15 @@ class Settings:
         status_url = os.getenv("CHUSKY_VOICE_STATUS_URL", "http://127.0.0.1:3003/internal/twilio/status").strip()
         if not secret or not deepgram or not turn_url.startswith(("http://", "https://")) or not turn_url.endswith("/turn") or not status_url.startswith(("http://", "https://")):
             raise RuntimeError("TWILIO_MEDIA_BRIDGE_SECRET, DEEPGRAM_API_KEY, CHUSKY_VOICE_TURN_URL ending in /turn, and CHUSKY_VOICE_STATUS_URL are required")
+        elevenlabs_enabled = os.getenv("VOICE_ELEVENLABS_ENABLED", "false").strip().lower() == "true"
+        elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY", "").strip()
+        elevenlabs_voice_id = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+        elevenlabs_model_id = os.getenv("ELEVENLABS_MODEL_ID", "eleven_flash_v2_5").strip()
+        if elevenlabs_enabled:
+            try:
+                validate_elevenlabs_configuration(elevenlabs_api_key, elevenlabs_voice_id, elevenlabs_model_id)
+            except ElevenLabsConfigurationError as error:
+                raise RuntimeError(str(error)) from error
         return cls(
             secret, deepgram, turn_url, status_url,
             max(60, min(int(os.getenv("VOICE_BRIDGE_MAX_CALL_SECONDS", "7200")), 14_400)),
@@ -97,6 +120,10 @@ class Settings:
             # silence window. Keep the default responsive for live calls.
             max(500, min(int(os.getenv("VOICE_STT_EOT_TIMEOUT_MS", "800")), 60_000)),
             os.getenv("VOICE_TTS_MODEL", "flux-haley-en").strip(),
+            elevenlabs_enabled,
+            elevenlabs_api_key,
+            elevenlabs_voice_id,
+            elevenlabs_model_id,
             os.getenv("VOICE_TWILIO_NATIVE_MULAW", "true").strip().lower() != "false",
             max(1, min(int(os.getenv("VOICE_BARGE_IN_MIN_CHARS", "2")), 100)),
             os.getenv("VOICE_GREETING", "Hi, this is Chusky. How can I help?").strip()[:500],
@@ -161,15 +188,15 @@ class RecallSettings:
             raise RecallConfigurationError("meeting_models_invalid", ("RECALL_STT_MODEL", "VOICE_TTS_MODEL"))
         return cls(
             secret, deepgram, turn_url, commit_url, authorize_url, visual_frame_url, realtime_secret, stt,
-            max(0.5, min(float(os.getenv("VOICE_STT_EOT_THRESHOLD", "0.65")), 0.9)),
-            max(500, min(int(os.getenv("VOICE_STT_EOT_TIMEOUT_MS", "800")), 60_000)),
+            max(0.5, min(float(os.getenv("RECALL_STT_EOT_THRESHOLD", "0.55")), 0.9)),
+            max(500, min(int(os.getenv("RECALL_STT_EOT_TIMEOUT_MS", "500")), 60_000)),
             max(100, min(int(os.getenv("RECALL_NOVA_ENDPOINTING_MS", "500")), 2_000)),
             max(1_000, min(int(os.getenv("RECALL_NOVA_UTTERANCE_END_MS", "1000")), 5_000)),
             tts,
             max(60, min(int(os.getenv("RECALL_MAX_MEETING_SECONDS", "7200")), 14_400)),
             max(1, min(int(os.getenv("RECALL_MAX_ACTIVE_MEETINGS", "4")), 20)),
             max(1, min(int(os.getenv("RECALL_COPILOT_MIN_INTERVAL_SECONDS", "4")), 120)),
-            max(4_000, min(int(os.getenv("RECALL_TURN_START_BUDGET_MS", os.getenv("VOICE_TURN_START_BUDGET_MS", "10000"))), 20_000)),
+            max(4_000, min(int(os.getenv("RECALL_TURN_START_BUDGET_MS", "6000")), 20_000)),
             os.getenv("RECALL_TURN_FALLBACK_ENABLED", "true").strip().lower() != "false",
         )
 
@@ -234,12 +261,19 @@ class TwilioVoiceCall:
         self.tts_lock = asyncio.Lock()
         self.tts_reader_task: asyncio.Task[None] | None = None
         self.tts_done_event: asyncio.Event | None = None
+        self.elevenlabs_context_id = f"twilio-{self.call_id}-{secrets.token_hex(8)}"
+        self.elevenlabs_runtime_fallback = False
         self.tts_first_audio_recorded = False
         self.turn_first_audio_event: asyncio.Event | None = None
         self.stt_resample_state: object | None = None
         self.tts_resample_state: object | None = None
         self.twilio_send_lock = asyncio.Lock()
         self.interrupted = False
+
+    @property
+    def _uses_elevenlabs_tts(self) -> bool:
+        """Whether this direct Twilio call uses the optional ElevenLabs path."""
+        return bool(getattr(self.settings, "elevenlabs_enabled", False)) and not self.elevenlabs_runtime_fallback
 
     async def run(self) -> None:
         try:
@@ -424,7 +458,11 @@ class TwilioVoiceCall:
         if self.tts_socket is not None:
             try:
                 async with self.tts_lock:
-                    await self.tts_socket.send(json.dumps({"type": "Interrupt"}))
+                    if self._uses_elevenlabs_tts:
+                        await self.tts_socket.send(json.dumps(elevenlabs_close_context(self.elevenlabs_context_id)))
+                        self.elevenlabs_context_id = f"twilio-{self.call_id}-{secrets.token_hex(8)}"
+                    else:
+                        await self.tts_socket.send(json.dumps({"type": "Interrupt"}))
             except Exception:
                 # The task cancellation below still closes a stalled TTS socket.
                 pass
@@ -479,6 +517,28 @@ class TwilioVoiceCall:
     async def _ensure_persistent_tts(self) -> None:
         if self.tts_socket is not None and self.tts_reader_task and not self.tts_reader_task.done():
             return
+        if self._uses_elevenlabs_tts:
+            validate_elevenlabs_configuration(
+                self.settings.elevenlabs_api_key,
+                self.settings.elevenlabs_voice_id,
+                self.settings.elevenlabs_model_id,
+            )
+            url = elevenlabs_stream_url(self.settings.elevenlabs_voice_id, self.settings.elevenlabs_model_id)
+            try:
+                self.tts_socket = await connect(
+                    url,
+                    additional_headers={"xi-api-key": self.settings.elevenlabs_api_key},
+                    max_size=1_000_000,
+                )
+                self.tts_resample_state = None
+                self.tts_reader_task = asyncio.create_task(self._receive_persistent_tts(), name=f"twilio-tts-{self.call_id}")
+                await self.tts_socket.send(json.dumps(elevenlabs_start_context(self.elevenlabs_context_id)))
+                return
+            except Exception:
+                self.elevenlabs_runtime_fallback = True
+                self.tts_socket = None
+                self.tts_reader_task = None
+                LOG.warning("ElevenLabs TTS unavailable; using Deepgram TTS for this call", extra={"call_id": self.call_id})
         if not re.fullmatch(r"flux-[a-z]+-en", self.tts_model):
             raise RuntimeError("VOICE_TTS_MODEL must be a Flux streaming model (for example flux-haley-en)")
         url = twilio_deepgram_speak_url(self.tts_model, native_mulaw=getattr(self.settings, "twilio_native_mulaw", True))
@@ -493,34 +553,19 @@ class TwilioVoiceCall:
         try:
             async for raw in socket:
                 if isinstance(raw, bytes):
-                    if self.interrupted or self.stop.is_set():
-                        continue
-                    # response_started_at is reset for every final turn;
-                    # record only the first audio frame for that response.
-                    if not self.tts_first_audio_recorded:
-                        audio_started_at = time.monotonic()
-                        first_audio_origin = self.eager_response_started_at or self.response_started_at
-                        first_audio_ms = max(0, int((audio_started_at - first_audio_origin) * 1000)) if first_audio_origin else 0
-                        self.metrics.tts_first_audio_ms_total += first_audio_ms
-                        self.metrics.tts_first_audio_count += 1
-                        if self.eager_response_started_at:
-                            self.metrics.eager_to_first_audio_samples.append(first_audio_ms)
-                            if self.response_started_at:
-                                after_final_ms = max(0, int((audio_started_at - self.response_started_at) * 1000))
-                                self.metrics.end_of_turn_to_first_audio_samples.append(after_final_ms)
-                        else:
-                            self.metrics.end_of_turn_to_first_audio_samples.append(first_audio_ms)
-                        self.tts_first_audio_recorded = True
-                        if self.turn_first_audio_event is not None:
-                            self.turn_first_audio_event.set()
-                    if getattr(self.settings, "twilio_native_mulaw", True):
-                        twilio_audio = raw
-                    else:
-                        twilio_audio, self.tts_resample_state = deepgram_linear16_to_twilio_mulaw(raw, self.tts_resample_state)
-                    for offset in range(0, len(twilio_audio), 1600):
-                        payload = base64.b64encode(twilio_audio[offset:offset + 1600]).decode()
-                        await self._send_twilio({"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}})
+                    await self._forward_tts_audio(raw)
                 elif isinstance(raw, str):
+                    if self._uses_elevenlabs_tts:
+                        event = parse_elevenlabs_audio_event(raw)
+                        if event is None:
+                            continue
+                        if event.audio:
+                            if self.interrupted or self.stop.is_set():
+                                continue
+                            await self._forward_tts_audio(event.audio)
+                        if event.is_final and self.tts_done_event is not None:
+                            self.tts_done_event.set()
+                        continue
                     event = json.loads(raw)
                     if event.get("type") == "SpeechMetadata":
                         if self.tts_done_event is not None:
@@ -528,7 +573,38 @@ class TwilioVoiceCall:
         except asyncio.CancelledError:
             raise
         except Exception:
+            if self._uses_elevenlabs_tts:
+                self.elevenlabs_runtime_fallback = True
             LOG.warning("Persistent Twilio TTS connection ended", extra={"call_id": self.call_id})
+
+    async def _forward_tts_audio(self, raw: bytes) -> None:
+        if self.interrupted or self.stop.is_set():
+            return
+        # response_started_at is reset for every final turn; record only the
+        # first audio frame for that response regardless of the TTS provider.
+        if not self.tts_first_audio_recorded:
+            audio_started_at = time.monotonic()
+            first_audio_origin = self.eager_response_started_at or self.response_started_at
+            first_audio_ms = max(0, int((audio_started_at - first_audio_origin) * 1000)) if first_audio_origin else 0
+            self.metrics.tts_first_audio_ms_total += first_audio_ms
+            self.metrics.tts_first_audio_count += 1
+            if self.eager_response_started_at:
+                self.metrics.eager_to_first_audio_samples.append(first_audio_ms)
+                if self.response_started_at:
+                    after_final_ms = max(0, int((audio_started_at - self.response_started_at) * 1000))
+                    self.metrics.end_of_turn_to_first_audio_samples.append(after_final_ms)
+            else:
+                self.metrics.end_of_turn_to_first_audio_samples.append(first_audio_ms)
+            self.tts_first_audio_recorded = True
+            if self.turn_first_audio_event is not None:
+                self.turn_first_audio_event.set()
+        if self._uses_elevenlabs_tts or getattr(self.settings, "twilio_native_mulaw", True):
+            twilio_audio = raw
+        else:
+            twilio_audio, self.tts_resample_state = deepgram_linear16_to_twilio_mulaw(raw, self.tts_resample_state)
+        for offset in range(0, len(twilio_audio), 1600):
+            payload = base64.b64encode(twilio_audio[offset:offset + 1600]).decode()
+            await self._send_twilio({"event": "media", "streamSid": self.stream_sid, "media": {"payload": payload}})
 
     async def _send_persistent_tts(self, text: str, flush: bool = False) -> None:
         if not text.strip() and not flush:
@@ -537,10 +613,16 @@ class TwilioVoiceCall:
         async with self.tts_lock:
             if self.tts_socket is None:
                 raise RuntimeError("persistent TTS connection is unavailable")
-            if text.strip():
-                await self.tts_socket.send(json.dumps({"type": "Speak", "text": text}))
-            if flush:
-                await self.tts_socket.send(json.dumps({"type": "Flush"}))
+            if self._uses_elevenlabs_tts:
+                if text.strip():
+                    await self.tts_socket.send(json.dumps(elevenlabs_speak(self.elevenlabs_context_id, text)))
+                if flush:
+                    await self.tts_socket.send(json.dumps(elevenlabs_flush(self.elevenlabs_context_id)))
+            else:
+                if text.strip():
+                    await self.tts_socket.send(json.dumps({"type": "Speak", "text": text}))
+                if flush:
+                    await self.tts_socket.send(json.dumps({"type": "Flush"}))
 
     async def _request_agent_stream(self, transcript: str, *, speculative: bool = False) -> VoiceTurnResult | None:
         """Stream one answer, guarding only the time before speech begins.
@@ -671,6 +753,8 @@ class TwilioVoiceCall:
         self.tts_resample_state = None
         if socket is not None:
             try:
+                if self._uses_elevenlabs_tts:
+                    await socket.send(json.dumps(elevenlabs_close_context(self.elevenlabs_context_id)))
                 await socket.close()
             except Exception:
                 pass
@@ -765,6 +849,13 @@ class TwilioVoiceCall:
             self.response_started_at = 0.0
 
     async def _speak(self, text: str) -> None:
+        if self._uses_elevenlabs_tts:
+            try:
+                await self._speak_elevenlabs_once(text)
+                return
+            except Exception:
+                self.elevenlabs_runtime_fallback = True
+                LOG.warning("ElevenLabs recovery speech failed; using Deepgram TTS", extra={"call_id": self.call_id})
         if not re.fullmatch(r"flux-[a-z]+-en", self.tts_model):
             raise RuntimeError("VOICE_TTS_MODEL must be a Flux streaming model (for example flux-haley-en)")
         url = twilio_deepgram_speak_url(self.tts_model, native_mulaw=getattr(self.settings, "twilio_native_mulaw", True))
@@ -803,6 +894,48 @@ class TwilioVoiceCall:
                             return
             finally:
                 self.tts_socket = None
+
+    async def _speak_elevenlabs_once(self, text: str) -> None:
+        """Speak a recovery line through a short-lived ElevenLabs context."""
+        validate_elevenlabs_configuration(
+            self.settings.elevenlabs_api_key,
+            self.settings.elevenlabs_voice_id,
+            self.settings.elevenlabs_model_id,
+        )
+        url = elevenlabs_stream_url(self.settings.elevenlabs_voice_id, self.settings.elevenlabs_model_id)
+        socket = await connect(
+            url,
+            additional_headers={"xi-api-key": self.settings.elevenlabs_api_key},
+            max_size=1_000_000,
+        )
+        context_id = f"twilio-{self.call_id}-{secrets.token_hex(8)}"
+        self.tts_socket = socket
+        try:
+            await socket.send(json.dumps(elevenlabs_start_context(context_id)))
+            await socket.send(json.dumps(elevenlabs_speak(context_id, text)))
+            await socket.send(json.dumps(elevenlabs_flush(context_id)))
+            async for raw in socket:
+                if not isinstance(raw, str):
+                    continue
+                event = parse_elevenlabs_audio_event(raw)
+                if event is None:
+                    continue
+                if event.audio:
+                    await self._forward_tts_audio(event.audio)
+                if event.is_final:
+                    if not self.interrupted:
+                        await self._send_twilio({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": f"chusky-{uuid.uuid4()}"}})
+                    return
+        finally:
+            self.tts_socket = None
+            try:
+                await socket.send(json.dumps(elevenlabs_close_context(context_id)))
+            except Exception:
+                pass
+            try:
+                await socket.close()
+            except Exception:
+                pass
 
     async def _notify_status(self, status: str, error: str | None = None) -> None:
         try:
@@ -1725,7 +1858,17 @@ async def health() -> dict[str, Any]:
     try:
         settings = Settings.from_env()
         twilio_ready = bool(settings.twilio_auth_token and settings.twilio_media_stream_url.startswith("wss://"))
-        return {"ok": True, "checks": {"twilioWebSocket": "configured" if twilio_ready else "misconfigured", "fluxStt": "configured" if settings.stt_model.startswith("flux-") else "misconfigured", "fluxTts": "configured" if settings.tts_model.startswith("flux-") else "misconfigured"}, "metrics": metrics.snapshot(len(calls.twilio_calls))}
+        return {
+            "ok": True,
+            "checks": {
+                "twilioWebSocket": "configured" if twilio_ready else "misconfigured",
+                "fluxStt": "configured" if settings.stt_model.startswith("flux-") else "misconfigured",
+                "fluxTts": "configured" if settings.tts_model.startswith("flux-") else "misconfigured",
+                "elevenLabsTts": "configured" if settings.elevenlabs_enabled else "disabled",
+                "activeTts": "elevenlabs" if settings.elevenlabs_enabled else "deepgram_flux",
+            },
+            "metrics": metrics.snapshot(len(calls.twilio_calls)),
+        }
     except RuntimeError:
         return {"ok": False, "checks": {"configuration": "misconfigured"}, "metrics": metrics.snapshot(len(calls.twilio_calls))}
 

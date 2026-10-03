@@ -20,7 +20,10 @@ does not launch speculative agent runs, so an unfinished draft cannot block
 the final turn or perform an action twice. Set `RECALL_STT_MODEL=nova-3` as a
 temporary rollback; Nova-3 uses Listen v1 with VAD, 500 ms endpointing, and a
 1,000 ms utterance-end fallback. This meeting setting is independent of the
-Flux STT configuration used for Twilio telephone calls.
+Flux STT configuration used for Twilio telephone calls. The meeting defaults
+use a 0.55 Flux end-of-turn threshold and 500 ms silence timeout for faster
+turn handoff; raise `RECALL_STT_EOT_TIMEOUT_MS` if participants commonly pause
+mid-sentence.
 
 It also accepts a separate **Twilio bidirectional Media Stream** at
 `/twilio/stream`. Twilio's wire format remains base64 `audio/x-mulaw` at 8 kHz.
@@ -162,6 +165,11 @@ VOICE_STT_EAGER_EOT_THRESHOLD=0.45
 VOICE_STT_EOT_THRESHOLD=0.65
 VOICE_STT_EOT_TIMEOUT_MS=800
 VOICE_TTS_MODEL=flux-haley-en
+VOICE_ELEVENLABS_ENABLED=false
+# Required only when VOICE_ELEVENLABS_ENABLED=true.
+# ELEVENLABS_API_KEY=<server-only ElevenLabs key>
+# ELEVENLABS_VOICE_ID=<approved ElevenLabs voice ID>
+# ELEVENLABS_MODEL_ID=eleven_flash_v2_5
 VOICE_BARGE_IN_MIN_CHARS=2
 VOICE_GREETING=Hi, this is Chusky. How can I help?
 VOICE_TURN_START_BUDGET_MS=10000
@@ -170,6 +178,14 @@ VOICE_TURN_FALLBACK_ENABLED=true
 
 The bridge uses Deepgram Flux conversational STT (`/v2/listen`) and streaming
 Flux TTS (`/v2/speak`) in Twilio's native raw 8 kHz μ-law format by default.
+Set `VOICE_ELEVENLABS_ENABLED=true` to replace only the direct Twilio TTS
+backend with ElevenLabs streaming TTS. When it is `false` (the default), the
+Deepgram Flux TTS path remains active and the ElevenLabs settings are ignored.
+The ElevenLabs path requires `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, and
+an optional `ELEVENLABS_MODEL_ID`; it requests `ulaw_8000` audio, keeps the
+Chusky brain and Deepgram Flux STT unchanged, and closes the active provider
+context on caller interruption. Recall meetings do not use this flag and
+continue to use their existing Deepgram path.
 The authenticated Chusky service may provide the owner's selected Flux voice
 for an individual Twilio call; that choice is bound into the short-lived HMAC
 stream ticket and overrides this environment default for that call only.
@@ -201,14 +217,13 @@ a per-call affinity key, and optional voice-model candidates. These are routing
 preferences rather than a hard latency guarantee; model/provider time-to-first-token
 and network conditions still affect the final result.
 
-The bridge also has a bounded response-start guard. `VOICE_TURN_START_BUDGET_MS`
-defaults to 10 seconds and applies only until the first audio frame of a final
-answer. It does not cut off a response that has already started speaking. If a
-final turn is still silent when the budget expires, the bridge cancels that
-stalled stream, clears any queued speech, and says a short natural recovery line
-without committing that line as the agent's answer. Eager speculative drafts do
-not speak a fallback; they are simply canceled and replaced by the definitive
-turn. Set `VOICE_TURN_FALLBACK_ENABLED=false` for a measured rollback to the
+The bridge also has a bounded response-start guard. For meetings,
+`RECALL_TURN_START_BUDGET_MS` defaults to 6 seconds and applies only until the
+first audio frame of a final answer. It does not cut off a response that has
+already started speaking. If a final turn is still silent when the budget
+expires, the bridge cancels that stalled stream, clears any queued speech, and
+says a short natural recovery line without committing that line as the agent's
+answer. Set `RECALL_TURN_FALLBACK_ENABLED=false` for a measured rollback to the
 previous behavior. Barge-in always cancels the active response and suppresses
 the fallback.
 

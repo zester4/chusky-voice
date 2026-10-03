@@ -86,6 +86,37 @@ class StreamingFakeTtsSocket:
         await self.items.put(None)
 
 
+class StreamingFakeElevenLabsSocket:
+    def __init__(self):
+        self.sent = []
+        self.items = asyncio.Queue()
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        item = await self.items.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+    async def send(self, message):
+        event = json.loads(message)
+        self.sent.append(event)
+        if event.get("text", "").strip():
+            await self.items.put(json.dumps({
+                "audio": base64.b64encode(b"\xff" * 160).decode(),
+                "is_final": False,
+            }))
+        if event.get("flush") is True:
+            await self.items.put(json.dumps({"is_final": True}))
+
+    async def close(self):
+        self.closed = True
+        await self.items.put(None)
+
+
 class FakeAgentStreamResponse:
     def __init__(self):
         self.lines = [
@@ -191,6 +222,28 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings.bridge_secret, "twilio-bridge-test-secret")
         self.assertEqual(settings.chusky_turn_url, "https://chusky.example/internal/twilio/turn")
         self.assertEqual(settings.chusky_status_url, "https://chusky.example/internal/twilio/status")
+        self.assertFalse(settings.elevenlabs_enabled)
+
+    def test_elevenlabs_requires_credentials_only_when_enabled(self):
+        base = {
+            "TWILIO_MEDIA_BRIDGE_SECRET": "twilio-bridge-test-secret",
+            "DEEPGRAM_API_KEY": "deepgram-test-key",
+            "CHUSKY_VOICE_TURN_URL": "https://chusky.example/internal/twilio/turn",
+            "CHUSKY_VOICE_STATUS_URL": "https://chusky.example/internal/twilio/status",
+            "VOICE_ELEVENLABS_ENABLED": "true",
+        }
+        with patch.dict(voice_app.os.environ, base, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "ELEVENLABS_API_KEY"):
+                voice_app.Settings.from_env()
+        with patch.dict(voice_app.os.environ, {
+            **base,
+            "ELEVENLABS_API_KEY": "eleven-test-key",
+            "ELEVENLABS_VOICE_ID": "voice_123",
+            "ELEVENLABS_MODEL_ID": "eleven_flash_v2_5",
+        }, clear=True):
+            settings = voice_app.Settings.from_env()
+        self.assertTrue(settings.elevenlabs_enabled)
+        self.assertEqual(settings.elevenlabs_voice_id, "voice_123")
 
     async def asyncSetUp(self):
         self.websocket = FakeTwilioWebSocket()
@@ -292,6 +345,96 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
 
         query = parse_qs(urlparse(opened_urls[0]).query)
         self.assertEqual(query["model"], ["flux-hannah-en"])
+
+    async def test_elevenlabs_streaming_tts_is_opt_in_and_forwards_twilio_mulaw(self):
+        elevenlabs_socket = StreamingFakeElevenLabsSocket()
+        opened = []
+        settings = SimpleNamespace(
+            bridge_secret="test-bridge-secret",
+            deepgram_api_key="test-deepgram-key",
+            chusky_turn_url="http://localhost/internal/twilio/turn",
+            chusky_status_url="http://localhost/internal/twilio/status",
+            stt_model="flux-general-en",
+            stt_eager_eot_threshold=0.45,
+            stt_eot_threshold=0.65,
+            stt_eot_timeout_ms=800,
+            tts_model="flux-haley-en",
+            elevenlabs_enabled=True,
+            elevenlabs_api_key="eleven-test-key",
+            elevenlabs_voice_id="voice_123",
+            elevenlabs_model_id="eleven_flash_v2_5",
+            twilio_native_mulaw=True,
+            greeting="",
+            turn_start_budget_ms=1000,
+            turn_fallback_enabled=True,
+        )
+        call = voice_app.TwilioVoiceCall(
+            "twc_eleven", 1, "MZ_eleven", self.websocket, settings, voice_app.BridgeMetrics(),
+        )
+        self.addAsyncCleanup(call.http.aclose)
+        self.addAsyncCleanup(call._close_persistent_tts)
+
+        async def fake_connect(url, **kwargs):
+            opened.append((url, kwargs))
+            return elevenlabs_socket
+
+        call.tts_done_event = asyncio.Event()
+        call.response_started_at = time.monotonic()
+        with patch.object(voice_app, "connect", fake_connect):
+            await call._ensure_persistent_tts()
+            await call._send_persistent_tts("Hello there.", flush=True)
+            await asyncio.wait_for(call.tts_done_event.wait(), 1)
+
+        self.assertEqual(len(opened), 1)
+        self.assertIn("output_format=ulaw_8000", opened[0][0])
+        self.assertNotIn("eleven-test-key", opened[0][0])
+        self.assertEqual(opened[0][1]["additional_headers"], {"xi-api-key": "eleven-test-key"})
+        self.assertEqual(elevenlabs_socket.sent[0]["text"], " ")
+        self.assertEqual(elevenlabs_socket.sent[-1]["flush"], True)
+        media = next(item for item in self.websocket.sent if item.get("event") == "media")
+        self.assertEqual(base64.b64decode(media["media"]["payload"]), b"\xff" * 160)
+
+    async def test_elevenlabs_connection_failure_falls_back_to_flux_for_the_call(self):
+        opened_urls = []
+        deepgram_socket = FakeTtsSocket()
+        settings = SimpleNamespace(
+            bridge_secret="test-bridge-secret",
+            deepgram_api_key="test-deepgram-key",
+            chusky_turn_url="http://localhost/internal/twilio/turn",
+            chusky_status_url="http://localhost/internal/twilio/status",
+            stt_model="flux-general-en",
+            stt_eager_eot_threshold=0.45,
+            stt_eot_threshold=0.65,
+            stt_eot_timeout_ms=800,
+            tts_model="flux-haley-en",
+            elevenlabs_enabled=True,
+            elevenlabs_api_key="eleven-test-key",
+            elevenlabs_voice_id="voice_123",
+            elevenlabs_model_id="eleven_flash_v2_5",
+            twilio_native_mulaw=True,
+            greeting="",
+            turn_start_budget_ms=1000,
+            turn_fallback_enabled=True,
+        )
+        call = voice_app.TwilioVoiceCall(
+            "twc_fallback", 1, "MZ_fallback", self.websocket, settings, voice_app.BridgeMetrics(),
+        )
+        self.addAsyncCleanup(call.http.aclose)
+        self.addAsyncCleanup(call._close_persistent_tts)
+
+        async def fake_connect(url, **_kwargs):
+            opened_urls.append(url)
+            if "elevenlabs.io" in url:
+                raise OSError("provider unavailable")
+            return deepgram_socket
+
+        with patch.object(voice_app, "connect", fake_connect):
+            await call._ensure_persistent_tts()
+            await call.tts_reader_task
+
+        self.assertTrue(call.elevenlabs_runtime_fallback)
+        self.assertIn("elevenlabs.io", opened_urls[0])
+        self.assertIn("api.deepgram.com", opened_urls[1])
 
     async def test_inbound_eager_turn_streams_once_and_commits_the_final_answer(self):
         agent_http = FakeAgentHttp()

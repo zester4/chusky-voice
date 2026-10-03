@@ -97,6 +97,41 @@ class RecallHealthTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {**env, "RECALL_STT_MODEL": "nova-3"}, clear=True):
             self.assertEqual(voice_app.RecallSettings.from_env().stt_model, "nova-3")
 
+    def test_meeting_latency_defaults_use_fast_but_provider_supported_values(self):
+        env = {
+            "RECALL_MEETINGS_ENABLED": "true",
+            "RECALL_MEDIA_BRIDGE_SECRET": "b" * 32,
+            "DEEPGRAM_API_KEY": "deepgram-test",
+            "CHUSKY_RECALL_TURN_STREAM_URL": "https://chusky.test/turn",
+            "CHUSKY_RECALL_COMMIT_TURN_URL": "https://chusky.test/commit",
+            "CHUSKY_RECALL_MEDIA_AUTHORIZE_URL": "https://chusky.test/authorize",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            resolved = voice_app.RecallSettings.from_env()
+
+        self.assertEqual(resolved.stt_eot_threshold, 0.55)
+        self.assertEqual(resolved.stt_eot_timeout_ms, 500)
+        self.assertEqual(resolved.turn_start_budget_ms, 6000)
+
+    def test_meeting_latency_settings_are_explicitly_overridable(self):
+        env = {
+            "RECALL_MEETINGS_ENABLED": "true",
+            "RECALL_MEDIA_BRIDGE_SECRET": "b" * 32,
+            "DEEPGRAM_API_KEY": "deepgram-test",
+            "CHUSKY_RECALL_TURN_STREAM_URL": "https://chusky.test/turn",
+            "CHUSKY_RECALL_COMMIT_TURN_URL": "https://chusky.test/commit",
+            "CHUSKY_RECALL_MEDIA_AUTHORIZE_URL": "https://chusky.test/authorize",
+            "RECALL_STT_EOT_THRESHOLD": "0.8",
+            "RECALL_STT_EOT_TIMEOUT_MS": "1200",
+            "RECALL_TURN_START_BUDGET_MS": "9000",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            resolved = voice_app.RecallSettings.from_env()
+
+        self.assertEqual(resolved.stt_eot_threshold, 0.8)
+        self.assertEqual(resolved.stt_eot_timeout_ms, 1200)
+        self.assertEqual(resolved.turn_start_budget_ms, 9000)
+
 
 if __name__ == "__main__":
     unittest.main()
