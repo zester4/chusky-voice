@@ -133,10 +133,10 @@ class Settings:
             os.getenv("VOICE_TWILIO_NATIVE_MULAW", "true").strip().lower() != "false",
             max(1, min(int(os.getenv("VOICE_BARGE_IN_MIN_CHARS", "2")), 100)),
             os.getenv("VOICE_GREETING", "Hi, this is Chusky. How can I help?").strip()[:500],
-            # Keep the recovery guard short enough to avoid a dead-air call,
-            # while leaving the normal streamed response untouched once its
-            # first audio has started.
-            max(1_500, min(int(os.getenv("VOICE_TURN_START_BUDGET_MS", "2500")), 20_000)),
+            # This is a recovery guard only. It must be long enough for the
+            # owner-scoped Chusky stream to produce its first audio; it is not
+            # a maximum answer duration.
+            max(4_000, min(int(os.getenv("VOICE_TURN_START_BUDGET_MS", "10000")), 20_000)),
             os.getenv("VOICE_TURN_FALLBACK_ENABLED", "true").strip().lower() != "false",
             max(500, min(int(os.getenv("VOICE_TOOL_PROGRESS_DELAY_MS", "2500")), 10_000)),
             os.getenv("VOICE_TOOL_PROGRESS_MESSAGE", "I’m still working on that, thanks for your patience.").strip()[:500],
@@ -632,10 +632,23 @@ class TwilioVoiceCall:
                             self.tts_done_event.set()
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except ConnectionClosed as error:
             if self._uses_elevenlabs_tts:
                 self.elevenlabs_runtime_fallback = True
-            LOG.warning("Persistent Twilio TTS connection ended", extra={"call_id": self.call_id})
+            LOG.warning(
+                "Persistent Twilio TTS connection ended",
+                extra={
+                    "call_id": self.call_id,
+                    "error_type": type(error).__name__,
+                    "close_code": getattr(error, "code", None),
+                    "close_reason": str(getattr(error, "reason", ""))[:120],
+                },
+            )
+        except Exception as error:
+            LOG.warning(
+                "Persistent Twilio TTS connection ended",
+                extra={"call_id": self.call_id, "error_type": type(error).__name__},
+            )
 
     async def _forward_tts_audio(self, raw: bytes) -> None:
         if self.interrupted or self.stop.is_set():

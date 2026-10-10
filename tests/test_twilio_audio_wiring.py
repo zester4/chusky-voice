@@ -233,7 +233,17 @@ class TwilioAudioWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings.chusky_turn_url, "https://chusky.example/internal/twilio/turn")
         self.assertEqual(settings.chusky_status_url, "https://chusky.example/internal/twilio/status")
         self.assertFalse(settings.elevenlabs_enabled)
-        self.assertEqual(settings.turn_start_budget_ms, 2500)
+        self.assertEqual(settings.turn_start_budget_ms, 10000)
+
+        with patch.dict(voice_app.os.environ, {
+            "TWILIO_MEDIA_BRIDGE_SECRET": "twilio-bridge-test-secret",
+            "DEEPGRAM_API_KEY": "deepgram-test-key",
+            "CHUSKY_VOICE_TURN_URL": "https://chusky.example/internal/twilio/turn",
+            "CHUSKY_VOICE_STATUS_URL": "https://chusky.example/internal/twilio/status",
+            "VOICE_TURN_START_BUDGET_MS": "2500",
+        }, clear=True):
+            guarded_settings = voice_app.Settings.from_env()
+        self.assertEqual(guarded_settings.turn_start_budget_ms, 4000)
 
     def test_elevenlabs_requires_credentials_only_when_enabled(self):
         base = {
