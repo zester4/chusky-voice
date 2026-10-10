@@ -3,9 +3,16 @@ from __future__ import annotations
 
 import asyncio
 from math import ceil, isfinite
-from typing import TypeVar
+from typing import Iterator, TypeVar
 
 T = TypeVar("T")
+
+# Twilio bidirectional Media Streams accept raw 8 kHz μ-law audio. A 160-byte
+# frame is exactly 20 ms at that rate, which lets the bridge pace audio at the
+# rate a telephone call consumes it instead of allowing provider chunks to
+# build an opaque playback buffer.
+TWILIO_MULAW_FRAME_BYTES = 160
+TWILIO_MULAW_FRAME_SECONDS = 0.020
 
 
 _TURN_FALLBACKS = (
@@ -13,6 +20,41 @@ _TURN_FALLBACKS = (
     "I’m checking that carefully now. One moment, please.",
     "I want to make sure I answer that properly. Give me a moment.",
 )
+
+
+def iter_twilio_mulaw_frames(
+    audio: bytes | bytearray | memoryview,
+    *,
+    frame_bytes: int = TWILIO_MULAW_FRAME_BYTES,
+) -> Iterator[bytes]:
+    """Yield provider audio in bounded frames without losing trailing bytes."""
+    if not isinstance(audio, (bytes, bytearray, memoryview)):
+        raise TypeError("audio must be bytes-like")
+    if isinstance(frame_bytes, bool) or not isinstance(frame_bytes, int) or frame_bytes <= 0:
+        raise ValueError("frame_bytes must be a positive integer")
+    payload = bytes(audio)
+    for offset in range(0, len(payload), frame_bytes):
+        yield payload[offset : offset + frame_bytes]
+
+
+def next_twilio_frame_schedule(
+    next_at: float | None,
+    now: float,
+    *,
+    frame_seconds: float = TWILIO_MULAW_FRAME_SECONDS,
+) -> tuple[float, float]:
+    """Return the delay and deadline for the next real-time playback frame.
+
+    A provider gap should not cause a burst when audio resumes, so the clock
+    catches up to ``now``. A frame that is already late is sent immediately.
+    """
+    if not isinstance(now, (int, float)) or isinstance(now, bool) or not isfinite(float(now)):
+        raise ValueError("now must be finite")
+    if not isinstance(frame_seconds, (int, float)) or isinstance(frame_seconds, bool) or not isfinite(float(frame_seconds)) or frame_seconds <= 0:
+        raise ValueError("frame_seconds must be positive and finite")
+    current = float(now)
+    scheduled = current if next_at is None or not isfinite(float(next_at)) or float(next_at) <= current else float(next_at)
+    return max(0.0, scheduled - current), scheduled + float(frame_seconds)
 
 
 def turn_start_deadline_exceeded(

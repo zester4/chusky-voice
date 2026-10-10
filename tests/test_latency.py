@@ -2,7 +2,10 @@ import asyncio
 import unittest
 
 from latency import (
+    TWILIO_MULAW_FRAME_BYTES,
+    iter_twilio_mulaw_frames,
     latency_summary,
+    next_twilio_frame_schedule,
     resolve_speculative_draft,
     take_tts_chunk,
     turn_fallback_text,
@@ -95,6 +98,34 @@ class TakeTtsChunkTests(unittest.TestCase):
         chunk = take_tts_chunk(text)
 
         self.assertEqual(chunk, ("x" * 80, "x" * 10))
+
+
+class TwilioPlaybackFrameTests(unittest.TestCase):
+    def test_provider_audio_is_resliced_into_twenty_millisecond_frames(self):
+        audio = bytes(range(256)) * 2
+
+        frames = list(iter_twilio_mulaw_frames(audio))
+
+        self.assertEqual([len(frame) for frame in frames], [TWILIO_MULAW_FRAME_BYTES, TWILIO_MULAW_FRAME_BYTES, TWILIO_MULAW_FRAME_BYTES, 32])
+        self.assertEqual(b"".join(frames), audio)
+
+    def test_empty_provider_audio_does_not_create_a_frame(self):
+        self.assertEqual(list(iter_twilio_mulaw_frames(b"")), [])
+
+    def test_playback_clock_sends_first_frame_now_and_paces_following_frames(self):
+        delay, next_at = next_twilio_frame_schedule(None, 10.0)
+        self.assertEqual(delay, 0.0)
+        self.assertEqual(next_at, 10.02)
+
+        delay, next_at = next_twilio_frame_schedule(next_at, 10.001)
+        self.assertAlmostEqual(delay, 0.019, places=6)
+        self.assertEqual(next_at, 10.04)
+
+    def test_playback_clock_catches_up_after_a_provider_gap_without_bursting(self):
+        delay, next_at = next_twilio_frame_schedule(10.02, 10.5)
+
+        self.assertEqual(delay, 0.0)
+        self.assertEqual(next_at, 10.52)
 
 
 class LatencySummaryTests(unittest.TestCase):

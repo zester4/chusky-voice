@@ -146,6 +146,11 @@ TWILIO_MEDIA_STREAM_URL=wss://voice.selithub.shop/twilio/stream
 TWILIO_INBOUND_ENABLED=true
 TWILIO_INBOUND_OWNER_USER_ID=<your Telegram numeric user ID>
 TWILIO_INBOUND_ALLOWED_CALLERS=+233550472834
+# Optional number-to-owner routes; the owner ID above remains the fallback.
+TWILIO_INBOUND_ROUTES=+15550000001=123,+15550000002=456
+# Optional outbound voicemail after Twilio DetectMessageEnd.
+TWILIO_VOICEMAIL_ENABLED=false
+TWILIO_VOICEMAIL_MESSAGE=Hi, this is Chusky calling. Please call back when you can.
 ```
 
 Chusky validates Twilio's signed TwiML and status callbacks. Its TwiML sends a
@@ -172,9 +177,22 @@ VOICE_ELEVENLABS_ENABLED=false
 # ELEVENLABS_MODEL_ID=eleven_flash_v2_5
 VOICE_BARGE_IN_MIN_CHARS=2
 VOICE_GREETING=Hi, this is Chusky. How can I help?
-VOICE_TURN_START_BUDGET_MS=10000
+# Dead-air recovery guard; normal streamed turns continue beyond this once
+# their first audio has started.
+VOICE_TURN_START_BUDGET_MS=2500
 VOICE_TURN_FALLBACK_ENABLED=true
+VOICE_TOOL_PROGRESS_DELAY_MS=2500
+VOICE_TOOL_PROGRESS_MESSAGE=I’m still working on that, thanks for your patience.
 ```
+
+During a Twilio voice turn, the model can stream a natural setup sentence
+before requesting a tool. Once the request passes the normal allowlist,
+argument-validation, and approval gates, Chusky emits an authenticated
+`tool_start` event to the bridge immediately before dispatch. The bridge
+speaks that activity and schedules at most one bounded waiting update while the
+tool is still running; any new model text, completion, error, barge-in, or call
+shutdown cancels it. The waiting text is a configurable recovery fallback, not
+the model's normal dialogue and is never committed to voice history.
 
 The bridge uses Deepgram Flux conversational STT (`/v2/listen`) and streaming
 Flux TTS (`/v2/speak`) in Twilio's native raw 8 kHz μ-law format by default.
@@ -203,8 +221,11 @@ bridge reuses the same response and commits it once; it does not cancel the
 draft and pay for a second model generation. If no eager event arrived or the
 final transcript differs, it starts a fresh final-turn stream. Only the exact
 final transcript and completed response are committed to Chusky history and
-usage. `mark` events are emitted after complete responses for playback
-tracking.
+usage. Provider audio is carried across arbitrary provider chunk boundaries,
+re-sliced into 160-byte/20 ms μ-law frames, and paced at telephone playback
+speed. An ordered Twilio `mark` follows each completed TTS response; the
+bridge records the echoed mark latency and clears both provider and Twilio
+playback immediately on caller interruption.
 
 Telephone turns use the dedicated `VOICE_MODEL`, the caller's durable account
 history, and relevant private memory. Their restricted native read-only tool
